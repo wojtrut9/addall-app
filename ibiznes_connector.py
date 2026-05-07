@@ -78,19 +78,25 @@ def _find_table(tables: list[str], *patterns: str) -> str | None:
     return None
 
 
+def _find_zam_header(tables: list[str]) -> str | None:
+    """Header zamówień (zamow) — z wyłączeniem tabel typu *spec/*poz."""
+    candidates = [t for t in tables if any(k in t.lower() for k in ("zam", "zamow", "order"))]
+    candidates = [t for t in candidates if not any(s in t.lower() for s in ("spec", "poz"))]
+    return candidates[0] if candidates else None
+
+
+def _find_zam_lines(tables: list[str]) -> str | None:
+    """Pozycje (line items) zamówień — typowo *zamspec / *zampoz / *zamowspec."""
+    for t in tables:
+        low = t.lower()
+        if ("zam" in low or "zamow" in low or "order" in low) and ("spec" in low or "poz" in low):
+            return t
+    return None
+
+
 def identify_tables(conn: pymysql.Connection) -> dict[str, str | None]:
     """
     Identyfikuje nazwy kluczowych tabel iBiznes.
-    Zwraca słownik: {
-        'spec_spzoo':    nazwa tabeli specyfikacji sp. z o.o.,
-        'spec_firma':    nazwa tabeli specyfikacji JDG,
-        'klienci_spzoo': nazwa tabeli klientów sp. z o.o.,
-        'klienci_firma': nazwa tabeli klientów JDG,
-        'towary_spzoo':  nazwa tabeli towarów sp. z o.o.,
-        'towary_firma':  nazwa tabeli towarów JDG,
-        'zam_spzoo':     nazwa tabeli zamówień sp. z o.o.,
-        'zam_firma':     nazwa tabeli zamówień JDG,
-    }
     """
     tables = discover_tables(conn)
 
@@ -108,9 +114,12 @@ def identify_tables(conn: pymysql.Connection) -> dict[str, str | None]:
         # Kartoteka towarów — typowe nazwy iBiznes
         "towary_spzoo": _find_table(spzoo, "towar", "kartot", "indeks", "artykul"),
         "towary_firma":  _find_table(firma, "towar", "kartot", "indeks", "artykul"),
-        # Zamówienia do dostawców
-        "zam_spzoo": _find_table(spzoo, "zam", "zamow", "order", "pz", "zakup"),
-        "zam_firma":  _find_table(firma, "zam", "zamow", "order", "pz", "zakup"),
+        # Zamówienia (header) — bez *spec/*poz
+        "zam_spzoo": _find_zam_header(spzoo),
+        "zam_firma": _find_zam_header(firma),
+        # Pozycje zamówień (line items) — *zamspec / *zampoz
+        "zamspec_spzoo": _find_zam_lines(spzoo),
+        "zamspec_firma": _find_zam_lines(firma),
         # Wszystkie tabele (do debugowania)
         "_all_tables": tables,
     }
@@ -128,6 +137,8 @@ _STAN_MIN_HINTS = ["StanMin", "MinStan", "Minimum", "MinIlosc"]
 _DOSTAWCA_HINTS = ["Dostawca", "Supplier", "Kontrahent"]
 _GRUPA_HINTS  = ["Grupa", "Kategoria", "Klasa", "Typ"]
 _JM_HINTS     = ["Jm", "JM", "JedMiary", "Jednostka"]
+# Flaga aktywności kartoteki — w iBiznes typowo 'Akt' z wartościami T/N
+_AKT_HINTS    = ["Akt", "Aktywny", "Active", "Aktywna"]
 
 
 def _pick_col(available: list[str], *hints: str) -> str | None:
@@ -319,12 +330,16 @@ def _remap_obroty(df: pd.DataFrame, tbl: str, conn: pymysql.Connection) -> pd.Da
 def fetch_kartoteka(
     conn: pymysql.Connection,
     tbl_info: dict,
+    only_active: bool = True,
 ) -> pd.DataFrame:
     """
     Pobiera kartotekę towarów.
-    Zwraca DataFrame z kolumnami jak eksport KartotekaTowarowiUslug.csv:
-    Kod towaru / usługi | Nazwa towaru / usługi | Grupa | Stan |
-    Cena zakupu netto | Cena Podstawowa netto | Stan Min. | Dostawca | ...
+
+    Domyślnie zwraca tylko AKTYWNE pozycje (flaga `Akt='T'` w iBiznes).
+    iBiznes trzyma w kartotece tysiące archiwalnych SKU (Akt='N'),
+    których nie chcemy w analizie zakupowej.
+
+    Zwraca DataFrame z kolumnami jak eksport KartotekaTowarowiUslug.csv.
     """
     frames = []
 
@@ -344,6 +359,7 @@ def fetch_kartoteka(
         dos_col    = _pick_col(cols, *_DOSTAWCA_HINTS)
         grupa_col  = _pick_col(cols, *_GRUPA_HINTS)
         jm_col     = _pick_col(cols, *_JM_HINTS)
+        akt_col    = _pick_col(cols, *_AKT_HINTS) if only_active else None
 
         if not kod_col or not nazwa_col:
             continue
@@ -366,18 +382,35 @@ def fetch_kartoteka(
         else:           select_parts.append("'' AS `Dostawca`")
         if jm_col:     select_parts.append(f"`{jm_col}` AS `JM`")
 
-        sql = f"SELECT {', '.join(select_parts)} FROM `{tbl}`"
+        # Filtr aktywności — tylko produkty z Akt='T'/'1'/NULL (NULL traktujemy jako aktywne)
+        where_clause = ""
+        if akt_col:
+            where_clause = (
+                f" WHERE (`{akt_col}` IS NULL "
+                f"OR UPPER(TRIM(CAST(`{akt_col}` AS CHAR))) IN ('T','TAK','Y','YES','1','A'))"
+            )
+
+        sql = f"SELECT {', '.join(select_parts)} FROM `{tbl}`{where_clause}"
 
         try:
             df = _q(conn, sql)
             if not df.empty:
                 frames.append(df)
         except Exception:
-            # Fallback: cała tabela i przemapuj
+            # Fallback: bez filtra aktywności
             try:
                 df = _q(conn, f"SELECT * FROM `{tbl}`")
                 if not df.empty:
                     df = _remap_kartoteka(df)
+                    if only_active and akt_col and akt_col in df.columns:
+                        # Filtr po stronie Pythona w razie czego
+                        active_mask = (
+                            df[akt_col].isna()
+                            | df[akt_col].astype(str).str.strip().str.upper().isin(
+                                ["T", "TAK", "Y", "YES", "1", "A", ""]
+                            )
+                        )
+                        df = df[active_mask]
                     frames.append(df)
             except Exception:
                 pass
@@ -472,17 +505,125 @@ def fetch_zamowienia(
     return pd.concat(frames, ignore_index=True)
 
 
+# ── Fetch: Pozycje otwartych zamówień (in-transit per SKU) ────────────────────
+
+def fetch_in_transit_lines(
+    conn: pymysql.Connection,
+    tbl_info: dict,
+) -> pd.DataFrame:
+    """
+    Pobiera pozycje (line items) OTWARTYCH zamówień do dostawców i agreguje
+    ilość per SKU — daje obraz "co już jedzie" do magazynu.
+
+    Otwarte zamówienia to te, które nie zostały jeszcze zrealizowane
+    (Etap='N', 'B' lub puste). Tabela line items zwykle ma nazwę
+    *zamspec / *zampoz w iBiznes.
+
+    Zwraca DataFrame z kolumnami:
+        Kod towaru | w_drodze (sztuki) | wartosc_w_drodze
+    Pusty DataFrame jeśli tabel nie ma lub nie ma otwartych pozycji.
+    """
+    frames = []
+
+    pairs = [
+        (tbl_info.get("zamspec_spzoo"), tbl_info.get("zam_spzoo")),
+        (tbl_info.get("zamspec_firma"), tbl_info.get("zam_firma")),
+    ]
+
+    for spec_tbl, head_tbl in pairs:
+        if not spec_tbl:
+            continue
+
+        try:
+            spec_cols = get_columns(conn, spec_tbl)
+        except Exception:
+            continue
+
+        kod_col = _pick_col(spec_cols, *_KOD_HINTS)
+        il_col  = _pick_col(spec_cols, "Il", "Ilosc", "Qty", "Quantity")
+        cena_col = _pick_col(spec_cols, *_CENA_Z_HINTS) or _pick_col(spec_cols, "Cena", "Cb")
+        nrz_col = _pick_col(spec_cols, "NrZ", "Nr", "Numer", "NrZam", "NrDoc", "NrR")
+
+        if not kod_col or not il_col:
+            continue
+
+        # Agregat: SUM(Il) per kod towaru
+        select_parts = [
+            f"`{kod_col}` AS `Kod towaru`",
+            f"SUM(CAST(REPLACE(REPLACE(CAST(s.`{il_col}` AS CHAR), ',', '.'), ' ', '') AS DECIMAL(18,3))) AS `w_drodze`",
+        ]
+        if cena_col:
+            select_parts.append(
+                f"SUM(CAST(REPLACE(REPLACE(CAST(s.`{il_col}` AS CHAR), ',', '.'), ' ', '') AS DECIMAL(18,3)) * "
+                f"CAST(REPLACE(REPLACE(CAST(s.`{cena_col}` AS CHAR), ',', '.'), ' ', '') AS DECIMAL(18,4))) AS `wartosc_w_drodze`"
+            )
+        else:
+            select_parts.append("0 AS `wartosc_w_drodze`")
+
+        # JOIN z tabelą header by odfiltrować zrealizowane zamówienia
+        join_clause = ""
+        where_clause = ""
+        if head_tbl and nrz_col:
+            try:
+                head_cols = get_columns(conn, head_tbl)
+            except Exception:
+                head_cols = []
+            head_nrz = _pick_col(head_cols, "NrZ", "Nr", "Numer", "NrZam", "NrDoc", "NrR")
+            etap_col = _pick_col(head_cols, "Etap", "Status", "Stan", "Realizacja")
+            if head_nrz and etap_col:
+                join_clause = (
+                    f" JOIN `{head_tbl}` h ON s.`{nrz_col}` = h.`{head_nrz}`"
+                )
+                # Otwarte = niezrealizowane (Etap N/B/0/1 lub puste)
+                where_clause = (
+                    f" WHERE (h.`{etap_col}` IS NULL "
+                    f"OR UPPER(TRIM(CAST(h.`{etap_col}` AS CHAR))) IN ('N','B','NOWE','0','1',''))"
+                )
+
+        sql = (
+            f"SELECT {select_parts[0]}, {select_parts[1]}"
+            + (f", {select_parts[2]}" if len(select_parts) > 2 else "")
+            + f" FROM `{spec_tbl}` s{join_clause}{where_clause}"
+            + f" GROUP BY s.`{kod_col}`"
+        )
+
+        try:
+            df = _q(conn, sql)
+            if not df.empty:
+                # Konwersja do floatów
+                df["w_drodze"] = pd.to_numeric(df["w_drodze"], errors="coerce").fillna(0)
+                if "wartosc_w_drodze" in df.columns:
+                    df["wartosc_w_drodze"] = pd.to_numeric(df["wartosc_w_drodze"], errors="coerce").fillna(0)
+                # Tylko pozycje > 0
+                df = df[df["w_drodze"] > 0]
+                if not df.empty:
+                    frames.append(df)
+        except Exception:
+            # Pomiń jeśli zapytanie nie przejdzie — analiza działa też bez tego
+            pass
+
+    if not frames:
+        return pd.DataFrame(columns=["Kod towaru", "w_drodze", "wartosc_w_drodze"])
+
+    result = pd.concat(frames, ignore_index=True)
+    # Może być ten sam SKU w obu spółkach — zsumuj
+    return (
+        result.groupby("Kod towaru", as_index=False)
+        .agg({"w_drodze": "sum", "wartosc_w_drodze": "sum"})
+    )
+
+
 # ── Główna funkcja: pobierz wszystko ─────────────────────────────────────────
 
 def fetch_all(
     db_url: str,
     days: int = 90,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
     """
     Główna funkcja — łączy się z iBiznes i pobiera wszystkie dane.
 
     Returns:
-        (kartoteka_df, obroty_df, zamowienia_df, tbl_info)
+        (kartoteka_df, obroty_df, zamowienia_df, in_transit_df, tbl_info)
         gdzie tbl_info zawiera m.in. '_all_tables' do debugowania.
     """
     conn = get_connection(db_url)
@@ -491,7 +632,8 @@ def fetch_all(
         kartoteka  = fetch_kartoteka(conn, tbl_info)
         obroty     = fetch_obroty(conn, tbl_info, days=days)
         zamowienia = fetch_zamowienia(conn, tbl_info)
+        in_transit = fetch_in_transit_lines(conn, tbl_info)
     finally:
         conn.close()
 
-    return kartoteka, obroty, zamowienia, tbl_info
+    return kartoteka, obroty, zamowienia, in_transit, tbl_info

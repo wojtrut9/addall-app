@@ -144,17 +144,18 @@ if mode == "ibiznes":
     if run_ibiznes and db_url_input:
         with st.spinner(f"Łączę się z iBiznes i pobieram dane za ostatnie {days} dni…"):
             try:
-                from ibiznes_connector import fetch_all, identify_tables, get_connection, discover_tables
+                from ibiznes_connector import fetch_all, identify_tables, get_connection
 
                 # Najpierw pokaż dostępne tabele (pomocne przy pierwszym uruchomieniu)
                 conn_test = get_connection(db_url_input)
                 tbl_info = identify_tables(conn_test)
                 conn_test.close()
 
-                all_tables = tbl_info.get("_all_tables", [])
-                spec_spzoo = tbl_info.get("spec_spzoo")
-                towary     = tbl_info.get("towary_spzoo") or tbl_info.get("towary_firma")
-                zam        = tbl_info.get("zam_spzoo") or tbl_info.get("zam_firma")
+                all_tables  = tbl_info.get("_all_tables", [])
+                spec_spzoo  = tbl_info.get("spec_spzoo")
+                towary      = tbl_info.get("towary_spzoo") or tbl_info.get("towary_firma")
+                zam         = tbl_info.get("zam_spzoo") or tbl_info.get("zam_firma")
+                zamspec     = tbl_info.get("zamspec_spzoo") or tbl_info.get("zamspec_firma")
 
                 if not spec_spzoo or not towary:
                     st.warning(
@@ -163,24 +164,27 @@ if mode == "ibiznes":
                         f"Zidentyfikowane:\n"
                         f"- Obroty (spec): `{spec_spzoo or '❌ nie znaleziono'}`\n"
                         f"- Towary: `{towary or '❌ nie znaleziono'}`\n"
-                        f"- Zamówienia: `{zam or '⚠️ nie znaleziono'}`\n\n"
+                        f"- Zamówienia (header): `{zam or '⚠️ nie znaleziono'}`\n"
+                        f"- Pozycje zamówień: `{zamspec or '⚠️ nie znaleziono'}`\n\n"
                         "Zgłoś to — dopasujemy nazwy tabel do Twojej bazy iBiznes."
                     )
 
-                # Pobierz dane
-                kartoteka_df, obroty_df, zamowienia_df, _ = fetch_all(db_url_input, days=days)
+                # Pobierz dane (5 elementów: kartoteka, obroty, zamowienia-header,
+                # in_transit-per-SKU, tbl_info)
+                kartoteka_df, obroty_df, zamowienia_df, in_transit_df, _ = fetch_all(db_url_input, days=days)
 
+                in_transit_count = len(in_transit_df) if in_transit_df is not None else 0
                 st.caption(
-                    f"Pobrano: {len(kartoteka_df)} produktów, "
+                    f"Pobrano: {len(kartoteka_df)} aktywnych produktów (kartoteka po filtrze Akt), "
                     f"{len(obroty_df)} ruchów magazynowych, "
-                    f"{len(zamowienia_df)} zamówień w drodze"
+                    f"{len(zamowienia_df)} otwartych zamówień (header), "
+                    f"{in_transit_count} pozycji 'w drodze' (per SKU)"
                 )
 
                 # Konwertuj na format plikowy i przekaż do engine
                 import io
-                import tempfile
 
-                def df_to_upload_file(df: "pd.DataFrame", name: str):
+                def df_to_upload_file(df, name: str):
                     """Symuluje obiekt wgranego pliku dla engine.analyze()."""
                     buf = io.BytesIO()
                     df.to_csv(buf, sep=";", index=False, encoding="utf-8")
@@ -193,7 +197,10 @@ if mode == "ibiznes":
                 zam_buf   = df_to_upload_file(zamowienia_df, "ZamówieniaDlaDostawcy.csv") if len(zamowienia_df) > 0 else None
 
                 analiza, zam_result, summary, context = analyze(
-                    kart_buf, obr_buf, zam_buf if zam_buf else None
+                    kart_buf, obr_buf,
+                    zam_buf if zam_buf else None,
+                    None,  # min_log_file
+                    in_transit_df=in_transit_df,
                 )
 
                 st.session_state.update({
@@ -291,6 +298,7 @@ else:
                     kart_file, obroty_file,
                     zam_file if locals().get("zam_file") else None,
                     min_log_file if locals().get("min_log_file") else None,
+                    in_transit_df=None,  # tryb plikowy nie ma danych "w drodze" per SKU
                 )
                 st.session_state.update({
                     "analiza": analiza,
@@ -325,21 +333,39 @@ st.caption(
     f"({summary['dni_okresu']} dni) | Wygenerowano: {summary['data_analizy']}"
 )
 
-m1, m2, m3, m4, m5 = st.columns(5)
+m1, m2, m3, m4, m5, m6 = st.columns(6)
 with m1:
-    st.metric("💰 Wartość magazynu", fmt_pln(summary["wartosc_magazynu"]))
+    st.metric(
+        "💰 Magazyn (aktywne)",
+        fmt_pln(summary["wartosc_magazynu"]),
+        f"cały: {fmt_pln(summary.get('wartosc_calego_magazynu', summary['wartosc_magazynu']))}",
+        delta_color="off",
+    )
 with m2:
-    st.metric("🚨 Zamów DZIŚ",       f"{summary['produktow_dzis']} pozycji",
-              f"≈ {fmt_pln(summary['wartosc_dzis'])}")
+    st.metric(
+        "🚚 W drodze",
+        f"{summary.get('produktow_w_drodze', 0)} poz.",
+        fmt_pln(summary.get("wartosc_w_drodze", 0)),
+        delta_color="off",
+    )
 with m3:
-    st.metric("🟡 Zamów w tygodniu", f"{summary['produktow_tydzien']} pozycji",
-              f"≈ {fmt_pln(summary['wartosc_tydzien'])}")
+    st.metric("🚨 Zamów DZIŚ",       f"{summary['produktow_dzis']} pozycji",
+              f"≈ {fmt_pln(summary['wartosc_dzis'])}", delta_color="inverse")
 with m4:
-    st.metric("📦 Aktywnych prod.",   summary["produktow_aktywnych"],
-              f"z {summary['produktow_total']} w bazie")
+    st.metric("🟡 Zamów w tygodniu", f"{summary['produktow_tydzien']} pozycji",
+              f"≈ {fmt_pln(summary['wartosc_tydzien'])}", delta_color="off")
 with m5:
+    st.metric("📦 Aktywnych prod.",   summary["produktow_aktywnych"],
+              f"z {summary['produktow_total']} w kartotece")
+with m6:
     st.metric("⚫ Dead stock",        f"{summary['dead_stock_produktow']} prod.",
               fmt_pln(summary["dead_stock_wartosc"]), delta_color="inverse")
+
+st.caption(
+    "ℹ️ **Zasady analizy:** Kartoteka jest filtrowana do produktów aktywnych (Akt='T' w iBiznes). "
+    "Rekomendacje 'Zamów' już uwzględniają to, co jest w drodze od dostawców — nie zamawiamy "
+    "podwójnie. Wartość 'magazynu (aktywne)' pomija dead stock."
+)
 
 st.divider()
 
@@ -398,7 +424,7 @@ dos_col   = find_col(analiza, "dostawca")
 
 display_cols = [c for c in [
     kod_col, nazwa_col, dos_col,
-    "Stan", "Stan Min.", "srednie_dzienne",
+    "Stan", "w_drodze", "Stan Min.", "srednie_dzienne",
     "dni_do_wyczerpania", "ile_zamowic", "wartosc_zamowienia",
 ] if c and c in analiza.columns]
 
@@ -408,6 +434,9 @@ col_labels = {
     "ile_zamowic":        "Zamów (szt)",
     "wartosc_zamowienia": "Wartość PLN",
     "wartosc_stanu":      "Wartość stanu PLN",
+    "wartosc_w_drodze":   "Wartość w drodze PLN",
+    "w_drodze":           "W drodze (szt)",
+    "efektywny_stan":     "Stan + w drodze",
     "marza_pct":          "Marża %",
 }
 
@@ -516,11 +545,32 @@ if not api_key:
         help="Zapisz jako OPENAI_API_KEY w Railway → Variables",
     )
 
+# Diagnostyka kontekstu — pomaga jeśli AI mówi "brak danych".
+with st.expander("🔧 Diagnostyka kontekstu wysyłanego do AI", expanded=False):
+    st.caption(
+        f"Długość kontekstu: **{len(context):,} znaków** | "
+        f"Linii: **{context.count(chr(10)) + 1}** | "
+        "Model używa pełnego kontekstu — to powinno wystarczyć aby AI poprawnie odpowiedział."
+    )
+    st.code(context[:5000] + ("\n...[ucięte]" if len(context) > 5000 else ""), language="text")
+
 if not api_key:
     st.info("Wpisz klucz API OpenAI żeby włączyć chat (~1-3 grosze za pytanie).")
 else:
     if "chat_history" not in st.session_state:
         st.session_state["chat_history"] = []
+
+    # Wybór modelu — gpt-4o jest wyraźnie inteligentniejszy niż mini przy
+    # długich, ustrukturyzowanych kontekstach po polsku.
+    model_choice = st.selectbox(
+        "Model AI:",
+        options=["gpt-4o-mini", "gpt-4o", "gpt-4.1", "gpt-4.1-mini"],
+        index=1,
+        help=(
+            "gpt-4o — najlepsza jakość, ~5 gr/pytanie. "
+            "gpt-4o-mini — tańszy (~1 gr/pytanie) ale czasem zbyt ostrożny przy długim kontekście."
+        ),
+    )
 
     for msg in st.session_state["chat_history"]:
         with st.chat_message(msg["role"]):
@@ -551,36 +601,73 @@ else:
 
         with st.chat_message("assistant"):
             with st.spinner("Myślę…"):
-                try:
-                    from openai import OpenAI
-                    client = OpenAI(api_key=api_key)
+                # System prompt — jednoznaczny, zachęca do AKTYWNEGO korzystania
+                # z danych poniżej. Wcześniej prompt mówił "nigdy nie zmyślaj"
+                # przez co model bywał paniczny i odpowiadał "brak danych" mimo
+                # że miał komplet w kontekście.
+                system_prompt = (
+                    "Jesteś asystentem zakupowym firmy Add All — dystrybutora chemii, "
+                    "opakowań i artykułów higienicznych dla HoReCa. Mówisz po polsku. "
+                    "Waluta: PLN.\n\n"
+                    "TWOJE ZADANIE:\n"
+                    "Aktywnie korzystaj z DANYCH ANALIZY poniżej, aby odpowiadać na pytania "
+                    "Anity (kupiec). Cytuj liczby DOKŁADNIE jak w sekcjach [SEKCJA: ...]. "
+                    "Jeżeli dana sekcja jest niepusta — wymień konkretne pozycje, dostawców, "
+                    "kwoty i ilości. Nie odpowiadaj 'brak informacji' jeśli widzisz dane — "
+                    "po prostu je przedstaw.\n\n"
+                    "ZASADY:\n"
+                    "- Nie wymyślaj liczb spoza danych. Jeśli czegoś rzeczywiście nie ma w "
+                    "  sekcjach, powiedz wprost 'tej informacji nie ma w analizie'.\n"
+                    "- Odpowiedzi krótkie, konkretne, z listą wypunktowaną gdy to pomaga.\n"
+                    "- Sumy podawaj jako: '12 345 PLN' (spacja jako separator tysięcy).\n"
+                    "- Sortuj rekomendacje wg priorytetu (najpierw 'Zamów dziś', potem tydzień).\n"
+                    "- Jeśli pytanie dotyczy zamówień, ZAWSZE wspomnij ile już jedzie 'w drodze' "
+                    "  (sekcja [SEKCJA: W DRODZE OD DOSTAWCÓW]).\n\n"
+                    "=== DANE ANALIZY ===\n"
+                    f"{context}\n"
+                    "=== KONIEC DANYCH ==="
+                )
 
-                    system_prompt = (
-                        "Jesteś asystentem magazynowym i zakupowym firmy Add All — "
-                        "dystrybutora chemii, opakowań i artykułów higienicznych dla HoReCa. "
-                        "Odpowiadasz WYŁĄCZNIE po polsku. Waluta: PLN. "
-                        "Odpowiedzi konkretne i zwięzłe. "
-                        "Korzystasz TYLKO z danych poniżej — nigdy nie zmyślasz liczb.\n\n"
-                        f"DANE Z ANALIZY:\n{context}"
-                    )
+                messages = [{"role": "system", "content": system_prompt}]
+                for msg in st.session_state["chat_history"][-8:]:
+                    messages.append({"role": msg["role"], "content": msg["content"]})
 
-                    messages = [{"role": "system", "content": system_prompt}]
-                    for msg in st.session_state["chat_history"][-8:]:
-                        messages.append({"role": msg["role"], "content": msg["content"]})
+                # Próba: wybrany model → fallback do gpt-4o-mini przy błędzie.
+                from openai import OpenAI
+                client = OpenAI(api_key=api_key)
 
-                    response = client.chat.completions.create(
-                        model="gpt-4o-mini",
-                        messages=messages,
-                        temperature=0.2,
-                        max_tokens=1200,
-                    )
-                    answer = response.choices[0].message.content
+                answer = None
+                last_err = None
+                for model_try in (model_choice, "gpt-4o-mini"):
+                    try:
+                        response = client.chat.completions.create(
+                            model=model_try,
+                            messages=messages,
+                            temperature=0.2,
+                            max_tokens=1500,
+                        )
+                        answer = response.choices[0].message.content
+                        if model_try != model_choice:
+                            st.caption(f"⚠️ Fallback na {model_try} (błąd przy {model_choice}: {last_err})")
+                        break
+                    except Exception as exc:
+                        last_err = str(exc)
+                        continue
+
+                if answer:
                     st.write(answer)
                     st.session_state["chat_history"].append(
                         {"role": "assistant", "content": answer}
                     )
-                except Exception as exc:
-                    st.error(f"Błąd API: {exc}")
+                else:
+                    st.error(
+                        f"❌ Błąd API OpenAI: {last_err}\n\n"
+                        "Najczęstsze przyczyny:\n"
+                        "- nieprawidłowy klucz `OPENAI_API_KEY`\n"
+                        "- brak środków na koncie OpenAI (billing)\n"
+                        "- limit zapytań (rate limit)\n"
+                        "- model niedostępny w Twoim regionie/koncie"
+                    )
 
     if st.session_state.get("chat_history"):
         if st.button("🗑 Wyczyść chat", key="clear_chat"):
