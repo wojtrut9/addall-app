@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timedelta
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 import pandas as pd
 import pymysql
@@ -81,15 +81,25 @@ def _validate_url(url: str) -> None:
 
 
 def _parse_url(url: str) -> dict:
-    """Parsuje mysql://user:pass@host:port/dbname na słownik parametrów."""
+    """Parsuje mysql://user:pass@host:port/dbname na słownik parametrów.
+
+    UWAGA na URL-encoding: hasła z znakami specjalnymi (np. '&', '@', '/',
+    '#') MUSZĄ być URL-encoded w connection stringu, ale pymysql oczekuje
+    dekodowanego hasła. urlparse() w Pythonie NIE dekoduje automatycznie —
+    trzeba ręcznie wywołać unquote().
+
+    Przykład: hasło 'P5rQ&p4dF' → URL: 'mysql://user:P5rQ%26p4dF@host/db'
+    Bez unquote() pymysql wysyłał literalnie 'P5rQ%26p4dF' i dostawał
+    'Access denied'.
+    """
     _validate_url(url)
     p = urlparse(url.strip())
     return {
         "host":     p.hostname,
         "port":     p.port or 3306,
-        "user":     p.username,
-        "password": p.password,
-        "database": p.path.lstrip("/"),
+        "user":     unquote(p.username) if p.username else None,
+        "password": unquote(p.password) if p.password else None,
+        "database": unquote(p.path.lstrip("/")),
         "charset":  "utf8mb4",
         "cursorclass": pymysql.cursors.DictCursor,
         "connect_timeout": 15,
