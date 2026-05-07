@@ -20,9 +20,70 @@ import pymysql.cursors
 
 # ── Połączenie ────────────────────────────────────────────────────────────────
 
+_BAD_HOSTS = {
+    "github.com", "www.github.com", "gitlab.com", "bitbucket.org",
+    "railway.app", "vercel.app", "localhost", "127.0.0.1", "0.0.0.0", "",
+}
+
+
+def _validate_url(url: str) -> None:
+    """Wyłapuje typowe pomyłki ZANIM pymysql wykona timeout 15s.
+
+    Najczęstszy błąd: ktoś wkleił link do repo (https://github.com/...)
+    zamiast connection stringa do MySQL.
+    """
+    if not url or not isinstance(url, str):
+        raise ValueError(
+            "IBIZNES_DB_URL jest pusty. Wpisz connection string w formacie "
+            "mysql://user:pass@host:port/dbname (lub ustaw zmienną środowiskową "
+            "IBIZNES_DB_URL w Railway → Variables)."
+        )
+
+    url_stripped = url.strip()
+
+    if url_stripped.lower().startswith(("http://", "https://")):
+        raise ValueError(
+            f"Wygląda jak URL strony, nie bazy MySQL: '{url_stripped[:60]}...'.\n"
+            "Powinno być w formacie: mysql://user:pass@host:3306/dbname"
+        )
+
+    if not url_stripped.lower().startswith("mysql://"):
+        raise ValueError(
+            f"Connection string musi zaczynać się od 'mysql://'. "
+            f"Otrzymano: '{url_stripped[:50]}...'."
+        )
+
+    try:
+        p = urlparse(url_stripped)
+    except Exception as e:
+        raise ValueError(f"Nieprawidłowy format URL bazy: {e}")
+
+    host = (p.hostname or "").lower()
+    if host in _BAD_HOSTS:
+        raise ValueError(
+            f"Host '{host}' nie jest serwerem MySQL iBiznes. "
+            "Sprawdź `IBIZNES_DB_URL` w Railway → Variables — powinien wskazywać "
+            "na bazę iBiznes (np. `db.firmatec.pl:3306`), a nie na github.com "
+            "ani inną stronę WWW."
+        )
+
+    if not p.username or p.password is None:
+        raise ValueError(
+            "Brak użytkownika lub hasła w connection stringu. "
+            "Format: mysql://user:pass@host:port/dbname"
+        )
+
+    if not p.path or p.path == "/":
+        raise ValueError(
+            "Brak nazwy bazy danych w URL (po porcie powinno być /nazwa_bazy). "
+            "Format: mysql://user:pass@host:3306/dbname"
+        )
+
+
 def _parse_url(url: str) -> dict:
     """Parsuje mysql://user:pass@host:port/dbname na słownik parametrów."""
-    p = urlparse(url)
+    _validate_url(url)
+    p = urlparse(url.strip())
     return {
         "host":     p.hostname,
         "port":     p.port or 3306,
@@ -47,9 +108,13 @@ def test_connection(db_url: str) -> tuple[bool, str]:
         conn = get_connection(db_url)
         conn.ping()
         conn.close()
-        return True, "Połączenie z iBiznes OK"
+        host = urlparse(db_url.strip()).hostname
+        return True, f"Połączenie z iBiznes OK ({host})"
+    except ValueError as e:
+        # Walidacja URL — pokazujemy "czystą" wskazówkę bez śmieci pymysql
+        return False, str(e)
     except Exception as e:
-        return False, f"Błąd połączenia: {e}"
+        return False, f"Błąd połączenia z bazą: {e}"
 
 
 # ── Odkrywanie tabel ──────────────────────────────────────────────────────────
