@@ -1,0 +1,585 @@
+"""ai_agent.py — Pełnoprawny agent AI dla Anity (kupca Add All).
+
+Trzy kluczowe rzeczy odróżniające go od zwykłego chatbota:
+
+1. **Function calling (tool use)** — agent sam wywołuje narzędzia
+   (query_products, get_dostawca_summary, list_dostawcy) aby uzyskać
+   konkretne, świeże dane z DataFrame analizy zamiast polegać tylko na
+   statycznym kontekście tekstowym.
+
+2. **Pamięć długoterminowa** — preferencje i nawyki Anity zapisywane
+   w pliku JSON (data/anita_memory.json). Agent potrafi sam zapisać
+   nowy fakt/preferencję przez tool save_preference / add_fact.
+
+3. **Iteracyjna pętla narzędzi** — agent może w jednej odpowiedzi
+   wywołać kilka narzędzi w łańcuchu (np. najpierw list_dostawcy,
+   potem query_products dla wybranego dostawcy).
+"""
+from __future__ import annotations
+
+import json
+import os
+from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+
+# ── Pamięć Anity ──────────────────────────────────────────────────────────────
+
+MEMORY_FILE = Path(os.environ.get("ANITA_MEMORY_PATH", "data/anita_memory.json"))
+MAX_HISTORY = 50
+
+
+def _load_memory() -> dict:
+    if not MEMORY_FILE.exists():
+        return {"preferences": {}, "facts": [], "history": []}
+    try:
+        return json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {"preferences": {}, "facts": [], "history": []}
+
+
+def _save_memory(memory: dict) -> None:
+    MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    MEMORY_FILE.write_text(
+        json.dumps(memory, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def get_memory() -> dict:
+    return _load_memory()
+
+
+def save_preference(key: str, value: str) -> None:
+    m = _load_memory()
+    m.setdefault("preferences", {})[key] = value
+    _save_memory(m)
+
+
+def remove_preference(key: str) -> None:
+    m = _load_memory()
+    m.setdefault("preferences", {}).pop(key, None)
+    _save_memory(m)
+
+
+def add_fact(fact: str) -> None:
+    m = _load_memory()
+    facts = m.setdefault("facts", [])
+    if fact and fact not in facts:
+        facts.append(fact)
+    _save_memory(m)
+
+
+def remove_fact(idx: int) -> None:
+    m = _load_memory()
+    facts = m.setdefault("facts", [])
+    if 0 <= idx < len(facts):
+        facts.pop(idx)
+    _save_memory(m)
+
+
+def add_history(question: str, answer: str) -> None:
+    m = _load_memory()
+    h = m.setdefault("history", [])
+    h.append({
+        "date": datetime.now().isoformat(timespec="seconds"),
+        "question": question[:500],
+        "answer": (answer or "")[:1000],
+    })
+    if len(h) > MAX_HISTORY:
+        m["history"] = h[-MAX_HISTORY:]
+    _save_memory(m)
+
+
+def memory_summary_text() -> str:
+    """Tekstowy snapshot pamięci do umieszczenia w system prompt."""
+    m = _load_memory()
+    parts: list[str] = []
+
+    prefs = m.get("preferences") or {}
+    if prefs:
+        parts.append("PREFERENCJE ANITY:")
+        for k, v in prefs.items():
+            parts.append(f"  - {k}: {v}")
+
+    facts = m.get("facts") or []
+    if facts:
+        parts.append("\nWIEDZA O FIRMIE / NAWYKI:")
+        for f in facts:
+            parts.append(f"  - {f}")
+
+    hist = m.get("history") or []
+    if hist:
+        recent = hist[-5:]
+        parts.append(f"\nHISTORIA — ostatnie {len(recent)} pytań Anity:")
+        for h in recent:
+            parts.append(f"  - [{h.get('date', '')[:10]}] {h.get('question', '')}")
+
+    return "\n".join(parts) if parts else "(pamięć pusta — to pierwsze użycie agenta)"
+
+
+# ── Narzędzia (operują na DataFrame analiza) ─────────────────────────────────
+
+def _get_col(df: pd.DataFrame, *hints: str) -> str | None:
+    for h in hints:
+        for c in df.columns:
+            if h.lower() in str(c).lower():
+                return c
+    return None
+
+
+def query_products(
+    analiza: pd.DataFrame,
+    status: str | None = None,
+    dostawca: str | None = None,
+    nazwa_zawiera: str | None = None,
+    min_marza: float | None = None,
+    max_marza: float | None = None,
+    max_dni_do_wyczerpania: float | None = None,
+    min_ile_zamowic: int | None = None,
+    sort_by: str = "wartosc_zamowienia",
+    ascending: bool = False,
+    top_n: int = 20,
+) -> str:
+    """Filtruje, sortuje i zwraca produkty z analizy jako JSON."""
+    df = analiza.copy()
+
+    if status:
+        df = df[df["status"].astype(str).str.strip().str.upper() == status.upper()]
+
+    dos_col = _get_col(df, "dostawca")
+    if dostawca and dos_col:
+        df = df[df[dos_col].astype(str).str.contains(dostawca, case=False, na=False)]
+
+    nazwa_col = _get_col(df, "nazwa towaru")
+    if nazwa_zawiera and nazwa_col:
+        df = df[df[nazwa_col].astype(str).str.contains(nazwa_zawiera, case=False, na=False)]
+
+    if min_marza is not None and "marza_pct" in df.columns:
+        df = df[df["marza_pct"] >= min_marza]
+    if max_marza is not None and "marza_pct" in df.columns:
+        df = df[df["marza_pct"] <= max_marza]
+    if max_dni_do_wyczerpania is not None and "dni_do_wyczerpania" in df.columns:
+        df = df[df["dni_do_wyczerpania"] <= max_dni_do_wyczerpania]
+    if min_ile_zamowic is not None and "ile_zamowic" in df.columns:
+        df = df[df["ile_zamowic"] >= min_ile_zamowic]
+
+    if sort_by in df.columns:
+        df = df.sort_values(sort_by, ascending=ascending)
+
+    df = df.head(int(top_n))
+
+    if df.empty:
+        return json.dumps({"count": 0, "products": [], "info": "Brak produktów spełniających kryteria."}, ensure_ascii=False)
+
+    kod_col = _get_col(df, "kod towaru / usługi", "kod towaru")
+
+    rows = []
+    for _, r in df.iterrows():
+        rows.append({
+            "kod": str(r.get(kod_col, "")) if kod_col else "",
+            "nazwa": str(r.get(nazwa_col, "")) if nazwa_col else "",
+            "dostawca": str(r.get(dos_col, "")) if dos_col else "",
+            "stan": float(r.get("Stan", 0) or 0),
+            "w_drodze": float(r.get("w_drodze", 0) or 0),
+            "efektywny_stan": float(r.get("efektywny_stan", 0) or 0),
+            "srednie_dzienne": round(float(r.get("srednie_dzienne", 0) or 0), 2),
+            "dni_do_wyczerpania": round(float(r.get("dni_do_wyczerpania", 0) or 0), 1),
+            "ile_zamowic": int(r.get("ile_zamowic", 0) or 0),
+            "wartosc_zamowienia": round(float(r.get("wartosc_zamowienia", 0) or 0), 0),
+            "wartosc_stanu": round(float(r.get("wartosc_stanu", 0) or 0), 0),
+            "marza_pct": round(float(r.get("marza_pct", 0) or 0), 1),
+            "status": str(r.get("status", "")),
+        })
+
+    suma_zamowienia = round(sum(r["wartosc_zamowienia"] for r in rows), 0)
+    return json.dumps(
+        {"count": len(rows), "suma_wartosci_zamowienia": suma_zamowienia, "products": rows},
+        ensure_ascii=False,
+    )
+
+
+def get_dostawca_summary(analiza: pd.DataFrame, dostawca: str) -> str:
+    """Szczegółowy snapshot per dostawca."""
+    dos_col = _get_col(analiza, "dostawca")
+    if not dos_col:
+        return json.dumps({"error": "Brak kolumny 'dostawca' w analizie."})
+    mask = analiza[dos_col].astype(str).str.contains(dostawca, case=False, na=False)
+    df = analiza[mask]
+    if df.empty:
+        return json.dumps({"error": f"Nie znaleziono dostawcy zawierającego '{dostawca}'."}, ensure_ascii=False)
+
+    aktywne = df[df["srednie_dzienne"] > 0] if "srednie_dzienne" in df.columns else df
+    dzis = df[df["status"] == "ZAMÓW DZIŚ"]
+    tydzien = df[df["status"] == "ZAMÓW TYDZIEŃ"]
+    dead = df[df["status"] == "DEAD STOCK"]
+
+    matched_names = sorted({str(x) for x in df[dos_col].dropna().unique()})
+
+    return json.dumps({
+        "dopasowani_dostawcy": matched_names,
+        "produktow_total": int(len(df)),
+        "produktow_aktywnych": int(len(aktywne)),
+        "wartosc_magazynu": round(float(df.get("wartosc_stanu", pd.Series([0])).sum()), 0),
+        "wartosc_w_drodze": round(float(df.get("wartosc_w_drodze", pd.Series([0])).sum()), 0),
+        "do_zamowienia_dzis": {
+            "liczba": int(len(dzis)),
+            "wartosc_pln": round(float(dzis.get("wartosc_zamowienia", pd.Series([0])).sum()), 0),
+        },
+        "do_zamowienia_tydzien": {
+            "liczba": int(len(tydzien)),
+            "wartosc_pln": round(float(tydzien.get("wartosc_zamowienia", pd.Series([0])).sum()), 0),
+        },
+        "dead_stock": {
+            "liczba": int(len(dead)),
+            "wartosc_pln": round(float(dead.get("wartosc_stanu", pd.Series([0])).sum()), 0),
+        },
+        "srednia_marza_pct": round(float(aktywne["marza_pct"].mean()) if not aktywne.empty and "marza_pct" in aktywne.columns else 0.0, 1),
+    }, ensure_ascii=False)
+
+
+def list_dostawcy(
+    analiza: pd.DataFrame,
+    sort_by: str = "wartosc_stanu",
+    top_n: int = 20,
+    only_with_orders: bool = False,
+) -> str:
+    """Lista dostawców z agregatami."""
+    dos_col = _get_col(analiza, "dostawca")
+    if not dos_col:
+        return json.dumps({"error": "Brak kolumny 'dostawca'."})
+
+    g = analiza.groupby(dos_col).agg(
+        produktow=("Stan", "count"),
+        aktywnych=("srednie_dzienne", lambda s: int((s > 0).sum())),
+        wartosc_stanu=("wartosc_stanu", "sum"),
+        wartosc_zamowienia=("wartosc_zamowienia", "sum"),
+        wartosc_w_drodze=("wartosc_w_drodze", "sum"),
+    ).reset_index()
+    g.rename(columns={dos_col: "dostawca"}, inplace=True)
+
+    if only_with_orders:
+        g = g[g["wartosc_zamowienia"] > 0]
+
+    if sort_by in g.columns:
+        g = g.sort_values(sort_by, ascending=False)
+    g = g.head(int(top_n))
+
+    for col in ("wartosc_stanu", "wartosc_zamowienia", "wartosc_w_drodze"):
+        if col in g.columns:
+            g[col] = g[col].round(0).astype(float)
+
+    return json.dumps({"count": len(g), "dostawcy": g.to_dict(orient="records")}, ensure_ascii=False)
+
+
+def get_overall_metrics(summary: dict) -> str:
+    """Zwraca pełny słownik metryk."""
+    return json.dumps({k: v for k, v in summary.items() if k != "min_log"}, ensure_ascii=False, default=str)
+
+
+# ── Tool definitions for OpenAI ───────────────────────────────────────────────
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "query_products",
+            "description": (
+                "Filtruje, sortuje i zwraca konkretne produkty z bieżącej analizy magazynowej. "
+                "Używaj zawsze gdy potrzebujesz konkretnych pozycji (np. 'co u BIACHEM do zamówienia', "
+                "'produkty z marżą poniżej 20%', 'top 10 dead-stocku'). "
+                "Zwraca JSON z polami: count, suma_wartosci_zamowienia, products[]."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["ZAMÓW DZIŚ", "ZAMÓW TYDZIEŃ", "OK", "DEAD STOCK", "JEDNORAZÓWKA", "NIEAKTYWNY"],
+                    },
+                    "dostawca": {"type": "string", "description": "Fragment nazwy dostawcy (case-insensitive)"},
+                    "nazwa_zawiera": {"type": "string", "description": "Fragment nazwy produktu"},
+                    "min_marza": {"type": "number"},
+                    "max_marza": {"type": "number"},
+                    "max_dni_do_wyczerpania": {"type": "number"},
+                    "min_ile_zamowic": {"type": "integer"},
+                    "sort_by": {
+                        "type": "string",
+                        "enum": [
+                            "wartosc_zamowienia", "ile_zamowic", "dni_do_wyczerpania",
+                            "srednie_dzienne", "marza_pct", "wartosc_stanu", "Stan", "w_drodze",
+                        ],
+                        "default": "wartosc_zamowienia",
+                    },
+                    "ascending": {"type": "boolean", "default": False},
+                    "top_n": {"type": "integer", "default": 20, "maximum": 100},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_dostawca_summary",
+            "description": (
+                "Szczegółowe podsumowanie per dostawca: ilość produktów, wartość magazynu, "
+                "ile w drodze, do zamówienia dziś/w tygodniu, dead stock, średnia marża."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "dostawca": {"type": "string", "description": "Nazwa lub fragment nazwy dostawcy"},
+                },
+                "required": ["dostawca"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_dostawcy",
+            "description": "Listuje wszystkich dostawców posortowanych wg metryki (np. wartość magazynu, do zamówienia).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sort_by": {
+                        "type": "string",
+                        "enum": ["wartosc_stanu", "wartosc_zamowienia", "wartosc_w_drodze", "produktow", "aktywnych"],
+                        "default": "wartosc_stanu",
+                    },
+                    "top_n": {"type": "integer", "default": 20},
+                    "only_with_orders": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "True = tylko dostawcy u których jest coś do zamówienia",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_overall_metrics",
+            "description": "Zwraca pełne metryki agregatu (wartość magazynu, dead stock, w drodze, daty itp.).",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_preference",
+            "description": (
+                "Zapisuje preferencję Anity do pamięci długoterminowej. Używaj GDY ANITA POWIE "
+                "'zapamiętaj że...', 'preferuję...', 'ustaw minimum...' lub gdy z rozmowy widać "
+                "powtarzający się wzorzec wartościowy do zapamiętania."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string", "description": "Krótki klucz, np. 'minimum_BIACHEM_PLN'"},
+                    "value": {"type": "string", "description": "Wartość preferencji"},
+                },
+                "required": ["key", "value"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_fact",
+            "description": (
+                "Dodaje fakt o firmie / sposobie pracy Anity do pamięci. Używaj gdy uczysz się "
+                "czegoś nowego (np. 'Anita zamawia u BIACHEM tylko w poniedziałki' albo "
+                "'minimum logistyczne ADEKS = 3000 PLN')."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "fact": {"type": "string"},
+                },
+                "required": ["fact"],
+            },
+        },
+    },
+]
+
+
+def _execute_tool(name: str, args: dict, analiza: pd.DataFrame, summary: dict) -> str:
+    try:
+        if name == "query_products":
+            return query_products(analiza, **args)
+        if name == "get_dostawca_summary":
+            return get_dostawca_summary(analiza, **args)
+        if name == "list_dostawcy":
+            return list_dostawcy(analiza, **args)
+        if name == "get_overall_metrics":
+            return get_overall_metrics(summary)
+        if name == "save_preference":
+            save_preference(args["key"], args["value"])
+            return json.dumps({"ok": True, "saved": {args["key"]: args["value"]}}, ensure_ascii=False)
+        if name == "add_fact":
+            add_fact(args["fact"])
+            return json.dumps({"ok": True, "added_fact": args["fact"]}, ensure_ascii=False)
+        return json.dumps({"error": f"Nieznane narzędzie: {name}"})
+    except TypeError as e:
+        return json.dumps({"error": f"Złe argumenty {name}: {e}"})
+    except Exception as e:
+        return json.dumps({"error": f"Błąd wywołania {name}: {e}"})
+
+
+# ── Główna funkcja agenta ─────────────────────────────────────────────────────
+
+DEFAULT_SYSTEM_PROMPT_TEMPLATE = """Jesteś pełnoprawnym AGENTEM AI dla Anity — kupca firmy Add All
+(dystrybutor chemii, opakowań i artykułów higienicznych dla HoReCa).
+
+TWOJA FILOZOFIA PRACY:
+- Jesteś agentem, nie czat-botem. Aktywnie korzystasz z NARZĘDZI poniżej żeby
+  uzyskać świeże, konkretne dane z bieżącej analizy magazynowej.
+- NIGDY nie odpowiadaj "tej informacji nie ma w analizie" zanim nie spróbujesz
+  użyć narzędzia query_products / get_dostawca_summary / list_dostawcy. Statyczny
+  kontekst pokazuje TYLKO podsumowanie — pełnie dane są dostępne przez narzędzia.
+- Pamiętaj historię rozmowy i ucz się preferencji Anity (save_preference, add_fact).
+- Możesz wywołać kilka narzędzi w łańcuchu (np. najpierw list_dostawcy, potem
+  query_products dla wybranego). Nie żałuj sobie iteracji — to robi cię lepszym.
+
+KIEDY UŻYWAĆ NARZĘDZI:
+- Pytanie o KONKRETNEGO dostawcę → get_dostawca_summary("BIACHEM")
+- Pytanie o produkty z FILTREM (status, marża, top N) → query_products
+- "Który dostawca ma najwięcej produktów krytycznych?" →
+  list_dostawcy(sort_by="wartosc_zamowienia", only_with_orders=True)
+- Pytanie o ogólne metryki / liczby → get_overall_metrics
+- Anita mówi "zapamiętaj że..." / nowy nawyk → save_preference / add_fact
+
+ZASADY ODPOWIEDZI:
+- Po polsku, konkretnie, przyjaźnie. Anita nie znosi laniem wody.
+- Liczby: '12 345 PLN' (spacja jako separator tysięcy).
+- Przy zamówieniach ZAWSZE wspomnij ile jest "w drodze" jeśli jest > 0.
+- Sortuj rekomendacje wg priorytetu: ZAMÓW DZIŚ → ZAMÓW TYDZIEŃ → reszta.
+- Listy wypunktowane gdy pomagają. Tabele markdownowe dla 5+ pozycji.
+- Cytuj liczby DOKŁADNIE jak narzędzia zwracają — bez zaokrąglania w głowie.
+- Jeśli używasz narzędzia, krótko wspomnij co znalazłeś (np. "Sprawdziłem
+  query_products z filtrem...") — to buduje zaufanie do liczb.
+
+PAMIĘĆ O ANITCIE (z poprzednich sesji):
+{memory_text}
+
+=== STATYCZNY SNAPSHOT ANALIZY (dla orientacji — szczegóły bierz z narzędzi) ===
+{context}
+=== KONIEC SNAPSHOTU ==="""
+
+
+def ask_agent(
+    question: str,
+    analiza: pd.DataFrame,
+    summary: dict,
+    context: str,
+    api_key: str,
+    model: str = "gpt-4.1",
+    chat_history: list[dict] | None = None,
+    max_iters: int = 6,
+    extra_system_instructions: str | None = None,
+) -> tuple[str | None, list[dict], str | None]:
+    """Główna funkcja: zapytaj agenta o cokolwiek, on sam pociągnie dane.
+
+    Returns:
+        (answer, tool_call_log, error)
+        answer = treść odpowiedzi (str) lub None gdy błąd
+        tool_call_log = lista wywołań narzędzi (do diagnostyki)
+        error = komunikat błędu lub None gdy OK
+    """
+    try:
+        from openai import OpenAI
+    except ImportError as e:
+        return None, [], f"Brak biblioteki openai: {e}"
+
+    client = OpenAI(api_key=api_key)
+
+    memory_text = memory_summary_text()
+    system_prompt = DEFAULT_SYSTEM_PROMPT_TEMPLATE.format(
+        memory_text=memory_text,
+        context=context,
+    )
+    if extra_system_instructions:
+        system_prompt += f"\n\n=== DODATKOWE INSTRUKCJE OD ANITY ===\n{extra_system_instructions}"
+
+    messages: list[dict] = [{"role": "system", "content": system_prompt}]
+    if chat_history:
+        for msg in chat_history[-8:]:
+            if msg.get("role") in ("user", "assistant") and msg.get("content"):
+                messages.append({"role": msg["role"], "content": msg["content"]})
+    messages.append({"role": "user", "content": question})
+
+    tool_log: list[dict] = []
+    answer: str | None = None
+    last_error: str | None = None
+
+    for iteration in range(max_iters):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=TOOLS,
+                tool_choice="auto",
+                temperature=0.2,
+            )
+        except Exception as e:
+            last_error = f"OpenAI API ({model}): {e}"
+            break
+
+        msg = response.choices[0].message
+        tool_calls = getattr(msg, "tool_calls", None) or []
+
+        if tool_calls:
+            messages.append({
+                "role": "assistant",
+                "content": msg.content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in tool_calls
+                ],
+            })
+
+            for tc in tool_calls:
+                name = tc.function.name
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                result = _execute_tool(name, args, analiza, summary)
+                tool_log.append({
+                    "iteration": iteration + 1,
+                    "name": name,
+                    "args": args,
+                    "result_preview": (result[:300] + "…") if len(result) > 300 else result,
+                })
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result,
+                })
+            continue
+
+        answer = msg.content or ""
+        break
+
+    if answer is None and last_error:
+        return None, tool_log, last_error
+
+    if answer is None:
+        return (
+            f"⚠️ Agent nie zakończył odpowiedzi w {max_iters} iteracjach narzędzi. "
+            "Spróbuj zadać bardziej konkretne pytanie.",
+            tool_log,
+            None,
+        )
+
+    add_history(question, answer)
+    return answer, tool_log, None

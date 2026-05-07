@@ -11,3 +11,7 @@ __pycache__/
 *.csv
 *.xlsx
 *.xls
+
+# Pamięć agenta — preferencje Anity (lokalna)
+data/anita_memory.json
+data/

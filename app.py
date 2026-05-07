@@ -529,11 +529,12 @@ with tab_dead:
 
 st.divider()
 
-# ── Chat AI ───────────────────────────────────────────────────────────────────
-st.subheader("5. Zapytaj AI o analizę")
+# ── Agent AI ──────────────────────────────────────────────────────────────────
+st.subheader("5. Agent AI — pełnoprawny asystent zakupowy")
 st.caption(
-    "AI odpowiada na podstawie właśnie przeliczonych danych. "
-    "Np. 'Co zamówić u BIACHEM?', 'Dlaczego 60 szt?', 'Top klienci'."
+    "Agent sam wywołuje narzędzia żeby odpowiedzieć na pytanie. "
+    "Pamięta Twoje preferencje między sesjami. Może filtrować, sortować, "
+    "porównywać dostawców i zapamiętywać Twoje nawyki."
 )
 
 api_key = get_secret("OPENAI_API_KEY")
@@ -545,44 +546,150 @@ if not api_key:
         help="Zapisz jako OPENAI_API_KEY w Railway → Variables",
     )
 
-# Diagnostyka kontekstu — pomaga jeśli AI mówi "brak danych".
-with st.expander("🔧 Diagnostyka kontekstu wysyłanego do AI", expanded=False):
+from ai_agent import (
+    ask_agent,
+    get_memory,
+    save_preference,
+    remove_preference,
+    add_fact,
+    remove_fact,
+)
+
+# ── Panel pamięci agenta ──────────────────────────────────────────────────────
+mem = get_memory()
+mem_count = len(mem.get("preferences", {})) + len(mem.get("facts", []))
+with st.expander(
+    f"🧠 Pamięć agenta — preferencje i nawyki Anity ({mem_count} zapisanych)",
+    expanded=False,
+):
+    col_pref, col_facts = st.columns(2)
+
+    with col_pref:
+        st.markdown("**Preferencje (klucz=wartość):**")
+        prefs = mem.get("preferences", {})
+        if not prefs:
+            st.caption("_Brak — agent nauczy się gdy będziesz mu mówić_ "
+                       "_'zapamiętaj że...' albo 'preferuję...'_")
+        for k, v in prefs.items():
+            c1, c2 = st.columns([10, 1])
+            c1.write(f"• `{k}` = **{v}**")
+            if c2.button("🗑", key=f"rmpref_{k}"):
+                remove_preference(k)
+                st.rerun()
+        with st.form(key="add_pref_form", clear_on_submit=True):
+            pk = st.text_input("Klucz:", placeholder="np. minimum_BIACHEM_PLN")
+            pv = st.text_input("Wartość:", placeholder="np. 5000")
+            if st.form_submit_button("➕ Dodaj preferencję") and pk and pv:
+                save_preference(pk.strip(), pv.strip())
+                st.rerun()
+
+    with col_facts:
+        st.markdown("**Fakty / nawyki:**")
+        facts = mem.get("facts", [])
+        if not facts:
+            st.caption("_Pusto — agent dodaje fakty automatycznie z rozmowy._")
+        for i, f in enumerate(facts):
+            c1, c2 = st.columns([10, 1])
+            c1.write(f"• {f}")
+            if c2.button("🗑", key=f"rmfact_{i}"):
+                remove_fact(i)
+                st.rerun()
+        with st.form(key="add_fact_form", clear_on_submit=True):
+            new_fact = st.text_input(
+                "Dodaj fakt ręcznie:",
+                placeholder="np. 'Anita woli zamawiać u BIACHEM w poniedziałki'",
+            )
+            if st.form_submit_button("➕ Dodaj fakt") and new_fact.strip():
+                add_fact(new_fact.strip())
+                st.rerun()
+
+    if mem.get("history"):
+        st.markdown("**Ostatnie pytania (historia):**")
+        for h in reversed(mem["history"][-10:]):
+            st.caption(f"📅 {h.get('date', '')[:16]} → {h.get('question', '')[:120]}")
+
+# Diagnostyka kontekstu
+with st.expander("🔧 Podgląd statycznego kontekstu wysyłanego do AI", expanded=False):
     st.caption(
-        f"Długość kontekstu: **{len(context):,} znaków** | "
+        f"Długość: **{len(context):,} znaków** | "
         f"Linii: **{context.count(chr(10)) + 1}** | "
-        "Model używa pełnego kontekstu — to powinno wystarczyć aby AI poprawnie odpowiedział."
+        "Agent ma też dostęp do narzędzi (query_products, get_dostawca_summary itp.) "
+        "więc kontekst to tylko snapshot — szczegóły bierze przez tool use."
     )
     st.code(context[:5000] + ("\n...[ucięte]" if len(context) > 5000 else ""), language="text")
 
 if not api_key:
-    st.info("Wpisz klucz API OpenAI żeby włączyć chat (~1-3 grosze za pytanie).")
+    st.info("Wpisz klucz API OpenAI żeby włączyć agenta (~1-5 gr/pytanie).")
 else:
     if "chat_history" not in st.session_state:
         st.session_state["chat_history"] = []
 
-    # Wybór modelu — gpt-4o jest wyraźnie inteligentniejszy niż mini przy
-    # długich, ustrukturyzowanych kontekstach po polsku.
-    model_choice = st.selectbox(
-        "Model AI:",
-        options=["gpt-4o-mini", "gpt-4o", "gpt-4.1", "gpt-4.1-mini"],
-        index=1,
-        help=(
-            "gpt-4o — najlepsza jakość, ~5 gr/pytanie. "
-            "gpt-4o-mini — tańszy (~1 gr/pytanie) ale czasem zbyt ostrożny przy długim kontekście."
+    # Wybór modelu — najnowsze rodzin: gpt-5 (jeśli dostępny), gpt-4.1, gpt-4o.
+    # Dla agenta z function calling zalecane gpt-4.1 lub gpt-5 — minimodel
+    # bywa „leniwy" i nie woła narzędzi. Fallback automatyczny do gpt-4o.
+    col_m1, col_m2 = st.columns([3, 4])
+    with col_m1:
+        model_choice = st.selectbox(
+            "🤖 Model AI:",
+            options=[
+                "gpt-5",
+                "gpt-5-mini",
+                "gpt-4.1",
+                "gpt-4.1-mini",
+                "gpt-4o",
+                "gpt-4o-mini",
+                "(własny — wpisz obok)",
+            ],
+            index=2,
+            help=(
+                "gpt-4.1 / gpt-5 — najmocniejsze, najlepsze tool use (~3-8 gr/pytanie).\n"
+                "gpt-4o — sprawdzony, średni koszt.\n"
+                "mini-warianty — tańsze, ale gorzej używają narzędzi."
+            ),
+        )
+    with col_m2:
+        custom_model = st.text_input(
+            "Własna nazwa modelu:",
+            value="" if model_choice != "(własny — wpisz obok)" else "gpt-5-pro",
+            disabled=(model_choice != "(własny — wpisz obok)"),
+            placeholder="np. gpt-5-pro, o1, gpt-4.1-mini-2025-04-14",
+        )
+
+    actual_model = custom_model.strip() if model_choice == "(własny — wpisz obok)" and custom_model.strip() else model_choice
+
+    # Dodatkowe instrukcje (sticky system addon)
+    extra_instr = st.text_area(
+        "📌 Dodatkowe instrukcje dla agenta (opcjonalne, pamiętane w sesji):",
+        value=st.session_state.get("extra_instr", ""),
+        height=70,
+        placeholder=(
+            "Np. 'Zawsze podaj sumę zamówienia per dostawca.' albo "
+            "'Jeśli marża < 15%, dodaj ostrzeżenie.'"
         ),
+        key="extra_instr",
     )
 
+    # Historia czatu
     for msg in st.session_state["chat_history"]:
         with st.chat_message(msg["role"]):
             st.write(msg["content"])
+            if msg.get("tool_log"):
+                with st.expander(f"🔧 Narzędzia użyte ({len(msg['tool_log'])} wywołań)", expanded=False):
+                    for t in msg["tool_log"]:
+                        st.caption(
+                            f"**{t['name']}** (iter {t['iteration']}) "
+                            f"args: `{t['args']}`"
+                        )
+                        st.code(t["result_preview"], language="json")
 
-    st.markdown("**Szybkie pytania:**")
+    # Szybkie pytania
+    st.markdown("**🎯 Szybkie pytania:**")
     qcols = st.columns(4)
     quick_qs = [
-        "Co zamówić pilnie dziś?",
-        "Pokaż zamówienia per dostawca",
-        "Który dostawca ma najwięcej produktów krytycznych?",
-        "Produkty z marżą poniżej 20%?",
+        "Co zamówić pilnie dziś? Podaj sumę per dostawca.",
+        "Pokaż top 5 dostawców wg wartości zamówień.",
+        "Produkty z marżą poniżej 20% — top 10 wg sprzedaży.",
+        "Jakie pozycje są w drodze i jaka łączna kwota?",
     ]
     for i, (qcol, q) in enumerate(zip(qcols, quick_qs)):
         with qcol:
@@ -590,93 +697,101 @@ else:
                 st.session_state["_pending_q"] = q
                 st.rerun()
 
-    pending_q = st.session_state.pop("_pending_q", None)
-    user_input = st.chat_input("Zadaj pytanie, np. 'Co zamówić u ADEKS?'")
-    question = user_input or pending_q
+    # Główne okno do promptowania (większe, wieloliniowe)
+    st.markdown("**💬 Twoje pytanie do agenta:**")
 
-    if question:
+    with st.form(key="agent_form", clear_on_submit=True):
+        pending_q = st.session_state.pop("_pending_q", "")
+        user_input = st.text_area(
+            "Pytanie:",
+            value=pending_q,
+            height=130,
+            placeholder=(
+                "Napisz cokolwiek — agent sam pociągnie odpowiednie dane:\n"
+                "• 'Sprawdź dostawcę BIACHEM i powiedz co warto zamówić.'\n"
+                "• 'Zapamiętaj że minimum logistyczne ADEKS to 3000 PLN.'\n"
+                "• 'Top 15 produktów z najmniejszym zapasem dni — koniecznie z dostawcą.'"
+            ),
+            label_visibility="collapsed",
+        )
+        col_b1, col_b2 = st.columns([1, 5])
+        with col_b1:
+            submitted = st.form_submit_button("▶ Zapytaj", type="primary", use_container_width=True)
+        with col_b2:
+            st.caption(f"Model: **{actual_model}** | Pamięć: **{mem_count}** zapisów")
+
+    if submitted and user_input.strip():
+        question = user_input.strip()
         st.session_state["chat_history"].append({"role": "user", "content": question})
+
         with st.chat_message("user"):
             st.write(question)
 
         with st.chat_message("assistant"):
-            with st.spinner("Myślę…"):
-                # System prompt — jednoznaczny, zachęca do AKTYWNEGO korzystania
-                # z danych poniżej. Wcześniej prompt mówił "nigdy nie zmyślaj"
-                # przez co model bywał paniczny i odpowiadał "brak danych" mimo
-                # że miał komplet w kontekście.
-                system_prompt = (
-                    "Jesteś asystentem zakupowym firmy Add All — dystrybutora chemii, "
-                    "opakowań i artykułów higienicznych dla HoReCa. Mówisz po polsku. "
-                    "Waluta: PLN.\n\n"
-                    "TWOJE ZADANIE:\n"
-                    "Aktywnie korzystaj z DANYCH ANALIZY poniżej, aby odpowiadać na pytania "
-                    "Anity (kupiec). Cytuj liczby DOKŁADNIE jak w sekcjach [SEKCJA: ...]. "
-                    "Jeżeli dana sekcja jest niepusta — wymień konkretne pozycje, dostawców, "
-                    "kwoty i ilości. Nie odpowiadaj 'brak informacji' jeśli widzisz dane — "
-                    "po prostu je przedstaw.\n\n"
-                    "ZASADY:\n"
-                    "- Nie wymyślaj liczb spoza danych. Jeśli czegoś rzeczywiście nie ma w "
-                    "  sekcjach, powiedz wprost 'tej informacji nie ma w analizie'.\n"
-                    "- Odpowiedzi krótkie, konkretne, z listą wypunktowaną gdy to pomaga.\n"
-                    "- Sumy podawaj jako: '12 345 PLN' (spacja jako separator tysięcy).\n"
-                    "- Sortuj rekomendacje wg priorytetu (najpierw 'Zamów dziś', potem tydzień).\n"
-                    "- Jeśli pytanie dotyczy zamówień, ZAWSZE wspomnij ile już jedzie 'w drodze' "
-                    "  (sekcja [SEKCJA: W DRODZE OD DOSTAWCÓW]).\n\n"
-                    "=== DANE ANALIZY ===\n"
-                    f"{context}\n"
-                    "=== KONIEC DANYCH ==="
+            with st.spinner(f"🤖 Agent pracuje (model: {actual_model})…"):
+                answer, tool_log, err = ask_agent(
+                    question=question,
+                    analiza=analiza,
+                    summary=summary,
+                    context=context,
+                    api_key=api_key,
+                    model=actual_model,
+                    chat_history=st.session_state["chat_history"][:-1],
+                    extra_system_instructions=extra_instr.strip() or None,
                 )
 
-                messages = [{"role": "system", "content": system_prompt}]
-                for msg in st.session_state["chat_history"][-8:]:
-                    messages.append({"role": msg["role"], "content": msg["content"]})
-
-                # Próba: wybrany model → fallback do gpt-4o-mini przy błędzie.
-                from openai import OpenAI
-                client = OpenAI(api_key=api_key)
-
-                answer = None
-                last_err = None
-                for model_try in (model_choice, "gpt-4o-mini"):
-                    try:
-                        response = client.chat.completions.create(
-                            model=model_try,
-                            messages=messages,
-                            temperature=0.2,
-                            max_tokens=1500,
-                        )
-                        answer = response.choices[0].message.content
-                        if model_try != model_choice:
-                            st.caption(f"⚠️ Fallback na {model_try} (błąd przy {model_choice}: {last_err})")
-                        break
-                    except Exception as exc:
-                        last_err = str(exc)
-                        continue
-
-                if answer:
-                    st.write(answer)
-                    st.session_state["chat_history"].append(
-                        {"role": "assistant", "content": answer}
+                # Fallback jeśli wybrany model padł
+                if err and actual_model != "gpt-4o":
+                    st.caption(f"⚠️ Model `{actual_model}` zwrócił błąd — próbuję `gpt-4o`…")
+                    answer, tool_log, err = ask_agent(
+                        question=question,
+                        analiza=analiza,
+                        summary=summary,
+                        context=context,
+                        api_key=api_key,
+                        model="gpt-4o",
+                        chat_history=st.session_state["chat_history"][:-1],
+                        extra_system_instructions=extra_instr.strip() or None,
                     )
-                else:
+
+                if err:
                     st.error(
-                        f"❌ Błąd API OpenAI: {last_err}\n\n"
+                        f"❌ Błąd agenta: {err}\n\n"
                         "Najczęstsze przyczyny:\n"
                         "- nieprawidłowy klucz `OPENAI_API_KEY`\n"
                         "- brak środków na koncie OpenAI (billing)\n"
-                        "- limit zapytań (rate limit)\n"
-                        "- model niedostępny w Twoim regionie/koncie"
+                        "- model niedostępny w Twoim koncie (sprawdź na platform.openai.com)\n"
+                        "- limit zapytań (rate limit)"
                     )
+                else:
+                    st.write(answer)
+                    if tool_log:
+                        with st.expander(
+                            f"🔧 Narzędzia użyte przez agenta ({len(tool_log)})",
+                            expanded=False,
+                        ):
+                            for t in tool_log:
+                                st.caption(
+                                    f"**{t['name']}** (iter {t['iteration']}) "
+                                    f"args: `{t['args']}`"
+                                )
+                                st.code(t["result_preview"], language="json")
+                    st.session_state["chat_history"].append({
+                        "role": "assistant",
+                        "content": answer,
+                        "tool_log": tool_log,
+                    })
 
     if st.session_state.get("chat_history"):
-        if st.button("🗑 Wyczyść chat", key="clear_chat"):
+        if st.button("🗑 Wyczyść chat (pamięć Anity zostaje)", key="clear_chat"):
             st.session_state["chat_history"] = []
             st.rerun()
 
 # ── Stopka ────────────────────────────────────────────────────────────────────
 st.divider()
 st.caption(
-    f"Add All Asystent Zakupowy v1.1 | "
-    f"Dane nie są zapisywane | {datetime.now().strftime('%Y')}"
+    f"Add All Asystent Zakupowy v2.0 (Agent AI) | "
+    f"Dane analizy nie są zapisywane, pamięć agenta = `data/anita_memory.json` "
+    f"(dla persystencji między deployami dodaj Railway Volume na `/app/data`) | "
+    f"{datetime.now().strftime('%Y')}"
 )
