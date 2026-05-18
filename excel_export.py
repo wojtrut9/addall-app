@@ -245,10 +245,18 @@ def _write_sheet_grouped_by_supplier(
         return
 
     available = [c for c in cols if c in df.columns]
+    if not available:
+        _write_sheet(writer, df, cols, sheet_name)
+        return
 
-    # Wytwórz blokowy DataFrame: każda grupa poprzedzona wierszem-separatorem
+    # Wytwórz blokowy DataFrame: każda grupa poprzedzona wierszem-separatorem.
+    # dropna=False — żeby wiersze z brakiem dostawcy też trafiły do raportu;
+    # bez tego groupby je gubił i `pd.concat([])` wywalał cały plik (openpyxl:
+    # "At least one sheet must be visible").
     blocks = []
-    for dostawca, grupa in df.groupby(dos_col, sort=False):
+    for dostawca, grupa in df.groupby(dos_col, sort=False, dropna=False):
+        if pd.isna(dostawca) or str(dostawca).strip() == "" or str(dostawca).lower() == "nan":
+            dostawca = "(brak dostawcy w kartotece)"
         info = lookup_supplier_open_orders(supplier_open, dostawca)
         # Treść separatora w pierwszej kolumnie (nazwa towaru zwykle)
         if info:
@@ -272,6 +280,11 @@ def _write_sheet_grouped_by_supplier(
         sep_row[available[0]] = separator_text
         blocks.append(pd.DataFrame([sep_row]))
         blocks.append(grupa[available])
+
+    if not blocks:
+        # Brak grup z dostawcą — zapisz "płaską" tabelę bez separatorów.
+        _write_sheet(writer, df, cols, sheet_name)
+        return
 
     combined = pd.concat(blocks, ignore_index=True)
     combined.rename(columns=RENAME_MAP).to_excel(

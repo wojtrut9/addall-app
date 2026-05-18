@@ -153,10 +153,22 @@ def _find_table(tables: list[str], *patterns: str) -> str | None:
     return None
 
 
+_ZAM_KEYWORDS = ("zam", "zamow", "zamów", "order", "zaz", "zd", "dokzak", "zakzam", "zamzak")
+
+
 def _find_zam_header(tables: list[str]) -> str | None:
-    """Header zamówień (zamow) — z wyłączeniem tabel typu *spec/*poz."""
-    candidates = [t for t in tables if any(k in t.lower() for k in ("zam", "zamow", "order"))]
-    candidates = [t for t in candidates if not any(s in t.lower() for s in ("spec", "poz"))]
+    """Header zamówień do dostawców — z wyłączeniem tabel typu *spec/*poz.
+
+    Próbujemy szerokiej listy fragmentów nazwy (iBiznes nazywa to różnie:
+    addallzam, addallzaz, addalldokzak, zamowienia, ...). Wykluczamy typowe
+    sufiksy line-itemów ('spec', 'poz') oraz pliki realizacji ('real')
+    żeby nie złapać tabeli pozycji jako headera.
+    """
+    candidates = [
+        t for t in tables
+        if any(k in t.lower() for k in _ZAM_KEYWORDS)
+        and not any(s in t.lower() for s in ("spec", "poz", "real"))
+    ]
     return candidates[0] if candidates else None
 
 
@@ -164,7 +176,7 @@ def _find_zam_lines(tables: list[str]) -> str | None:
     """Pozycje (line items) zamówień — typowo *zamspec / *zampoz / *zamowspec."""
     for t in tables:
         low = t.lower()
-        if ("zam" in low or "zamow" in low or "order" in low) and ("spec" in low or "poz" in low):
+        if any(k in low for k in _ZAM_KEYWORDS) and ("spec" in low or "poz" in low):
             return t
     return None
 

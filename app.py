@@ -191,6 +191,41 @@ if mode == "ibiznes":
                     f"{lines_count} line items w otwartych dokumentach"
                 )
 
+                # Diagnostyka — kiedy zamówień jest 0 a w iBiznes są dokumenty,
+                # pokaż jaką tabelę znaleźliśmy + wszystkie tabele z prefiksem
+                # addall/firma, żeby łatwo podać prawidłową nazwę.
+                if len(zamowienia_df) == 0:
+                    spzoo_tables = [t for t in all_tables if t.lower().startswith("addall")]
+                    firma_tables = [t for t in all_tables if t.lower().startswith("firma")]
+                    other_tables = [
+                        t for t in all_tables
+                        if not t.lower().startswith(("addall", "firma"))
+                    ]
+                    with st.expander(
+                        "⚠️ Nie wykryto otwartych zamówień — kliknij aby zobaczyć tabele bazy",
+                        expanded=True,
+                    ):
+                        st.markdown(
+                            f"**Zidentyfikowane tabele zamówień (header):**\n"
+                            f"- sp. z o.o.: `{zam or '❌ nie znaleziono'}`\n"
+                            f"- firma: `{tbl_info.get('zam_firma') or '❌ nie znaleziono'}`\n"
+                            f"\n**Pozycje zamówień (line items):**\n"
+                            f"- sp. z o.o.: `{zamspec or '❌ nie znaleziono'}`\n"
+                            f"- firma: `{tbl_info.get('zamspec_firma') or '❌ nie znaleziono'}`"
+                        )
+                        st.markdown(
+                            "**Wszystkie tabele bazy iBiznes** — znajdź nazwę "
+                            "odpowiadającą *Zamówieniom do dostawców* "
+                            "(np. z prefiksem `addall…` lub `firma…`) i daj znać, "
+                            "która to — dopasujemy auto-discovery:"
+                        )
+                        if spzoo_tables:
+                            st.code("addall*:\n  " + "\n  ".join(spzoo_tables), language="text")
+                        if firma_tables:
+                            st.code("firma*:\n  " + "\n  ".join(firma_tables), language="text")
+                        if other_tables:
+                            st.code("inne:\n  " + "\n  ".join(other_tables), language="text")
+
                 # Konwertuj na format plikowy i przekaż do engine
                 import io
 
