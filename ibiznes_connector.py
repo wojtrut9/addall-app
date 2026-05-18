@@ -153,30 +153,47 @@ def _find_table(tables: list[str], *patterns: str) -> str | None:
     return None
 
 
-_ZAM_KEYWORDS = ("zam", "zamow", "zamów", "order", "zaz", "zd", "dokzak", "zakzam", "zamzak")
-
-
 def _find_zam_header(tables: list[str]) -> str | None:
-    """Header zamówień do dostawców — z wyłączeniem tabel typu *spec/*poz.
+    """Header zamówień ZAKUPU (do dostawców) — w iBiznes nazwa kończy się na 'zamz'.
 
-    Próbujemy szerokiej listy fragmentów nazwy (iBiznes nazywa to różnie:
-    addallzam, addallzaz, addalldokzak, zamowienia, ...). Wykluczamy typowe
-    sufiksy line-itemów ('spec', 'poz') oraz pliki realizacji ('real')
-    żeby nie złapać tabeli pozycji jako headera.
+    Konwencja nazewnictwa iBiznes:
+      *zams   = zamówienia sprzedaży (od klientów) — header
+      *zamsy  = pozycje zamówień sprzedaży
+      *zamz   = zamówienia ZAKUPU / do dostawców — header ← TO
+      *zamzy  = pozycje zamówień zakupu ← line items dla nas
+
+    Pomijamy '*towaryzam' (tabela powiązań towar-zamówienie, nie nagłówek)
+    i tabele line-itemów po sufiksie 'y'.
     """
-    candidates = [
-        t for t in tables
-        if any(k in t.lower() for k in _ZAM_KEYWORDS)
-        and not any(s in t.lower() for s in ("spec", "poz", "real"))
-    ]
-    return candidates[0] if candidates else None
+    # 1) Preferowany: dokładny sufiks 'zamz' (np. addallspkazogrzamz, firmazamz)
+    for t in tables:
+        if t.lower().endswith("zamz"):
+            return t
+    # 2) Fallback dla innych nazewnictw (zaz, dokzak, zakzam, …)
+    for t in tables:
+        low = t.lower()
+        if "towaryzam" in low or "spec" in low or "poz" in low or "real" in low:
+            continue
+        if low.endswith(("zams", "zamsy", "zamzy")):
+            continue  # to są sprzedaż lub pozycje
+        if any(k in low for k in ("zamz", "zaz", "dokzak", "zakzam", "zamzak", "zamow", "order")):
+            return t
+    return None
 
 
 def _find_zam_lines(tables: list[str]) -> str | None:
-    """Pozycje (line items) zamówień — typowo *zamspec / *zampoz / *zamowspec."""
+    """Pozycje zamówień zakupu — w iBiznes sufiks 'zamzy' (np. addallspkazogrzamzy).
+
+    Fallback dla innych ERP-ów: tabele kończące się na 'spec'/'poz' zawierające 'zam'.
+    """
+    # 1) Preferowany sufiks iBiznes: 'zamzy'
+    for t in tables:
+        if t.lower().endswith("zamzy"):
+            return t
+    # 2) Fallback: *zamspec / *zampoz / *zamowspec
     for t in tables:
         low = t.lower()
-        if any(k in low for k in _ZAM_KEYWORDS) and ("spec" in low or "poz" in low):
+        if ("zam" in low or "zaz" in low) and ("spec" in low or "poz" in low):
             return t
     return None
 
