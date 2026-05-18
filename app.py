@@ -134,6 +134,73 @@ if mode == "ibiznes":
                 except Exception as e:
                     st.error(f"Błąd: {e}")
 
+        if st.button("🔍 Pokaż schemat tabel zamówień", disabled=not db_url_input):
+            with st.spinner("Czytam schemat…"):
+                try:
+                    from ibiznes_connector import (
+                        get_connection, identify_tables, get_columns,
+                    )
+                    conn = get_connection(db_url_input)
+                    try:
+                        tbl_info = identify_tables(conn)
+                        zam_h = tbl_info.get("zam_spzoo") or tbl_info.get("zam_firma")
+                        zam_l = tbl_info.get("zamspec_spzoo") or tbl_info.get("zamspec_firma")
+                        out = {}
+                        with conn.cursor() as cur:
+                            for label, tbl in (("HEADER", zam_h), ("LINE_ITEMS", zam_l)):
+                                if not tbl:
+                                    out[label] = ("(brak tabeli)", [], [])
+                                    continue
+                                cols = get_columns(conn, tbl)
+                                # Spróbuj rozkład wartości Etap (jeśli kolumna istnieje)
+                                etap_col = next(
+                                    (c for c in cols if c.lower() in ("etap","status","stan","realizacja")),
+                                    None,
+                                )
+                                etap_dist = []
+                                if label == "HEADER" and etap_col:
+                                    try:
+                                        cur.execute(
+                                            f"SELECT `{etap_col}` AS etap, COUNT(*) AS n "
+                                            f"FROM `{tbl}` GROUP BY `{etap_col}` ORDER BY n DESC"
+                                        )
+                                        etap_dist = list(cur.fetchall())
+                                    except Exception:
+                                        pass
+                                # Próbka 2 wierszy
+                                try:
+                                    cur.execute(f"SELECT * FROM `{tbl}` LIMIT 2")
+                                    sample = list(cur.fetchall())
+                                except Exception:
+                                    sample = []
+                                out[label] = (tbl, cols, etap_dist, sample)
+                    finally:
+                        conn.close()
+
+                    for label, data in out.items():
+                        st.markdown(f"### {label}: `{data[0]}`")
+                        if len(data) > 1 and data[1]:
+                            st.code("Kolumny:\n  " + "\n  ".join(data[1]), language="text")
+                        if len(data) > 2 and data[2]:
+                            st.markdown("**Rozkład wartości Etap/Status:**")
+                            for row in data[2]:
+                                vals = list(row.values()) if isinstance(row, dict) else list(row)
+                                st.write(f"  • `{vals[0]!r}` → {vals[1]} dokumentów")
+                        if len(data) > 3 and data[3]:
+                            import json
+                            st.markdown("**Próbka (2 wiersze):**")
+                            st.code(
+                                json.dumps(
+                                    [dict(r) for r in data[3]],
+                                    indent=2, ensure_ascii=False, default=str,
+                                ),
+                                language="json",
+                            )
+                except Exception as e:
+                    import traceback as _tb
+                    st.error(f"Błąd: {e}")
+                    st.code(_tb.format_exc(), language="text")
+
         if st.button("📋 Pokaż wszystkie tabele bazy", disabled=not db_url_input):
             with st.spinner("Czytam listę tabel…"):
                 try:
