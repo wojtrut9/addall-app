@@ -134,6 +134,41 @@ if mode == "ibiznes":
                 except Exception as e:
                     st.error(f"Błąd: {e}")
 
+        if st.button("📋 Pokaż wszystkie tabele bazy", disabled=not db_url_input):
+            with st.spinner("Czytam listę tabel…"):
+                try:
+                    from ibiznes_connector import (
+                        get_connection, discover_tables, identify_tables,
+                    )
+                    conn = get_connection(db_url_input)
+                    try:
+                        tables = discover_tables(conn)
+                        tbl_info = identify_tables(conn)
+                    finally:
+                        conn.close()
+                    addall = [t for t in tables if t.lower().startswith("addall")]
+                    firma  = [t for t in tables if t.lower().startswith("firma")]
+                    other  = [
+                        t for t in tables
+                        if not t.lower().startswith(("addall", "firma"))
+                    ]
+                    st.success(f"Znaleziono {len(tables)} tabel w bazie iBiznes.")
+                    st.markdown(
+                        f"**Auto-wykryte:**\n"
+                        f"- Obroty (spec): `{tbl_info.get('spec_spzoo') or '❌'}`\n"
+                        f"- Towary (kartoteka): `{tbl_info.get('towary_spzoo') or tbl_info.get('towary_firma') or '❌'}`\n"
+                        f"- Zamówienia (header): `{tbl_info.get('zam_spzoo') or tbl_info.get('zam_firma') or '❌'}`\n"
+                        f"- Pozycje zamówień: `{tbl_info.get('zamspec_spzoo') or tbl_info.get('zamspec_firma') or '❌'}`"
+                    )
+                    if addall:
+                        st.code("addall*:\n  " + "\n  ".join(addall), language="text")
+                    if firma:
+                        st.code("firma*:\n  " + "\n  ".join(firma), language="text")
+                    if other:
+                        st.code("inne:\n  " + "\n  ".join(other), language="text")
+                except Exception as e:
+                    st.error(f"Błąd: {e}")
+
     with col_run:
         run_ibiznes = st.button(
             "⚡ Pobierz dane z iBiznes i analizuj",
