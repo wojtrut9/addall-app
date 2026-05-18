@@ -437,7 +437,10 @@ with dl1:
             type="primary", use_container_width=True,
         )
     except Exception as e:
-        st.error(f"Błąd pliku: {e}")
+        import traceback as _tb
+        st.error(f"Błąd pliku: {type(e).__name__}: {e}")
+        with st.expander("🔧 Pełny traceback (do diagnostyki)", expanded=False):
+            st.code(_tb.format_exc(), language="text")
 
 with dl2:
     try:
@@ -450,7 +453,10 @@ with dl2:
             use_container_width=True,
         )
     except Exception as e:
-        st.error(f"Błąd pliku: {e}")
+        import traceback as _tb
+        st.error(f"Błąd pliku: {type(e).__name__}: {e}")
+        with st.expander("🔧 Pełny traceback", expanded=False):
+            st.code(_tb.format_exc(), language="text")
 
 with dl3:
     st.info(
