@@ -24,6 +24,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from engine import lookup_supplier_open_orders
+
 # ── Pamięć Anity ──────────────────────────────────────────────────────────────
 
 MEMORY_FILE = Path(os.environ.get("ANITA_MEMORY_PATH", "data/anita_memory.json"))
@@ -273,8 +275,91 @@ def list_dostawcy(
 
 
 def get_overall_metrics(summary: dict) -> str:
-    """Zwraca pełny słownik metryk."""
-    return json.dumps({k: v for k, v in summary.items() if k != "min_log"}, ensure_ascii=False, default=str)
+    """Zwraca pełny słownik metryk (bez ciężkich pól typu mapa supplier_open_orders)."""
+    skip = {"min_log", "supplier_open_orders"}
+    return json.dumps(
+        {k: v for k, v in summary.items() if k not in skip},
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+def get_open_orders_for_supplier(summary: dict, dostawca: str) -> str:
+    """Zwraca listę OTWARTYCH zamówień u danego dostawcy z numerami dokumentów,
+    datami realizacji, wartościami i listą pozycji (SKU) w każdym.
+
+    Używaj GDY pokazujesz Anitcie rekomendację 'zamów X u DOSTAWCA' — żeby
+    powiedzieć jej "u tego dostawcy masz już otwarte zamówienie ZAZ/123/2026
+    z 5 pozycjami za 12 345 PLN; możesz dorzucić nowe produkty zamiast
+    tworzyć osobny dokument".
+    """
+    mapping = summary.get("supplier_open_orders", {}) or {}
+    info = lookup_supplier_open_orders(mapping, dostawca)
+
+    if not info:
+        return json.dumps({
+            "dostawca": dostawca,
+            "ma_otwarte_zamowienia": False,
+            "info": f"Brak otwartych zamówień u dostawcy pasującego do '{dostawca}'.",
+        }, ensure_ascii=False)
+
+    orders_out = []
+    for o in info.get("orders", [])[:20]:
+        orders_out.append({
+            "nr": o.get("nr", ""),
+            "data_realiz": o.get("data_realiz", ""),
+            "wartosc_pln": o.get("wartosc", 0),
+            "liczba_pozycji": len(o.get("skus", [])),
+            "produkty": [
+                {
+                    "kod": s.get("kod", ""),
+                    "nazwa": s.get("nazwa", ""),
+                    "ilosc": s.get("ilosc", 0),
+                }
+                for s in o.get("skus", [])[:10]
+            ],
+        })
+    payload = {
+        "dostawca": info.get("nazwa", ""),
+        "ma_otwarte_zamowienia": True,
+        "liczba_dokumentow": info.get("liczba_dokumentow", 0),
+        "laczna_wartosc_pln": info.get("laczna_wartosc", 0),
+        "najblizsza_data_realizacji": info.get("najblizsza_data"),
+        "kody_skus_w_drodze": (info.get("kody_w_drodze", []) or [])[:50],
+        "orders": orders_out,
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def list_suppliers_with_open_orders(summary: dict, top_n: int = 30) -> str:
+    """Lista wszystkich dostawców u których są OTWARTE zamówienia,
+    posortowana wg wartości. Używaj GDY Anita pyta 'gdzie mam otwarte
+    zamówienia' lub 'do którego dostawcy najwięcej jedzie'."""
+    mapping = summary.get("supplier_open_orders", {}) or {}
+    if not mapping:
+        return json.dumps({
+            "count": 0,
+            "info": "Brak otwartych zamówień u jakiegokolwiek dostawcy.",
+        }, ensure_ascii=False)
+
+    rows = []
+    for _, info in mapping.items():
+        rows.append({
+            "dostawca": info.get("nazwa", ""),
+            "liczba_dokumentow": info.get("liczba_dokumentow", 0),
+            "laczna_wartosc_pln": info.get("laczna_wartosc", 0),
+            "najblizsza_data_realizacji": info.get("najblizsza_data"),
+            "liczba_skus_w_drodze": len(info.get("kody_w_drodze", [])),
+        })
+    rows.sort(key=lambda r: r["laczna_wartosc_pln"], reverse=True)
+    rows = rows[: int(top_n)]
+    return json.dumps({
+        "count": len(rows),
+        "laczna_wartosc_wszystkich": round(
+            sum(r["laczna_wartosc_pln"] for r in rows), 0
+        ),
+        "dostawcy": rows,
+    }, ensure_ascii=False)
 
 
 # ── Tool definitions for OpenAI ───────────────────────────────────────────────
@@ -368,6 +453,47 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "get_open_orders_for_supplier",
+            "description": (
+                "Zwraca listę OTWARTYCH zamówień u danego dostawcy: numery dokumentów "
+                "(np. ZAZ/123/2026), daty realizacji, wartości i pozycje (SKU) w każdym. "
+                "WYWOŁUJ AUTOMATYCZNIE GDY rekomendujesz zamówienie czegoś u konkretnego "
+                "dostawcy — żeby powiedzieć Anitcie 'u tego dostawcy masz już otwarte "
+                "zamówienia X, Y — możesz dorzucić nowe pozycje zamiast tworzyć osobny "
+                "dokument'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "dostawca": {
+                        "type": "string",
+                        "description": "Nazwa lub fragment nazwy dostawcy (case-insensitive)",
+                    },
+                },
+                "required": ["dostawca"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_suppliers_with_open_orders",
+            "description": (
+                "Listuje WSZYSTKICH dostawców u których są otwarte zamówienia — "
+                "liczba dokumentów, łączna wartość, najbliższa data realizacji. "
+                "Posortowane wg wartości."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "top_n": {"type": "integer", "default": 30, "maximum": 100},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "save_preference",
             "description": (
                 "Zapisuje preferencję Anity do pamięci długoterminowej. Używaj GDY ANITA POWIE "
@@ -415,6 +541,10 @@ def _execute_tool(name: str, args: dict, analiza: pd.DataFrame, summary: dict) -
             return list_dostawcy(analiza, **args)
         if name == "get_overall_metrics":
             return get_overall_metrics(summary)
+        if name == "get_open_orders_for_supplier":
+            return get_open_orders_for_supplier(summary, **args)
+        if name == "list_suppliers_with_open_orders":
+            return list_suppliers_with_open_orders(summary, **args)
         if name == "save_preference":
             save_preference(args["key"], args["value"])
             return json.dumps({"ok": True, "saved": {args["key"]: args["value"]}}, ensure_ascii=False)
@@ -449,13 +579,30 @@ KIEDY UŻYWAĆ NARZĘDZI:
 - "Który dostawca ma najwięcej produktów krytycznych?" →
   list_dostawcy(sort_by="wartosc_zamowienia", only_with_orders=True)
 - Pytanie o ogólne metryki / liczby → get_overall_metrics
+- "Gdzie mam otwarte zamówienia?" → list_suppliers_with_open_orders
+- Polecasz coś u dostawcy X → ZAWSZE wywołaj get_open_orders_for_supplier("X")
+  żeby sprawdzić czy są otwarte dokumenty (możliwość dorzucenia)
 - Anita mówi "zapamiętaj że..." / nowy nawyk → save_preference / add_fact
 
-ZASADY ODPOWIEDZI:
+ZASADY ODPOWIEDZI — to są ZAŁOŻENIA KRYTYCZNE NIE PRZEKRACZALNE:
 - Po polsku, konkretnie, przyjaźnie. Anita nie znosi laniem wody.
 - Liczby: '12 345 PLN' (spacja jako separator tysięcy).
-- Przy zamówieniach ZAWSZE wspomnij ile jest "w drodze" jeśli jest > 0.
+
+⚠️ NAZWA DOSTAWCY przy KAŻDEJ rekomendacji zakupowej:
+- ZAWSZE — bezwzględnie — podaj NAZWĘ DOSTAWCY przy każdej pozycji
+  do zamówienia. Format: "**[NAZWA DOSTAWCY]** — produkt X (Y szt., Z PLN)".
+- Grupuj rekomendacje PER DOSTAWCA (nie liniowo) — Anita zamawia DOKUMENTAMI
+  do firm, więc widok "u BIACHEM zamów A,B,C; u JS zamów D,E" jest 10x
+  bardziej użyteczny niż lista pomieszana.
+- Przy każdym dostawcy SPRAWDŹ czy ma już OTWARTE ZAMÓWIENIA
+  (get_open_orders_for_supplier). Jeśli TAK — POWIEDZ to wyraźnie:
+  "🚚 U dostawcy X masz JUŻ otwarte: ZAZ/123/2026 (do 12.05) na 5 678 PLN
+  z 3 pozycjami; możesz **dorzucić** te nowe SKU zamiast tworzyć nowy dokument."
+  TO POZWALA ANITCIE NIE DUBLOWAĆ WYSIŁKU.
 - Sortuj rekomendacje wg priorytetu: ZAMÓW DZIŚ → ZAMÓW TYDZIEŃ → reszta.
+- Przy każdej pozycji ZAWSZE wspomnij ile jest "w drodze" jeśli > 0.
+
+POZOSTAŁE ZASADY:
 - Listy wypunktowane gdy pomagają. Tabele markdownowe dla 5+ pozycji.
 - Cytuj liczby DOKŁADNIE jak narzędzia zwracają — bez zaokrąglania w głowie.
 - Jeśli używasz narzędzia, krótko wspomnij co znalazłeś (np. "Sprawdziłem

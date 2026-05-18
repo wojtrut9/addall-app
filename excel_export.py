@@ -11,12 +11,15 @@ import pandas as pd
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from engine import lookup_supplier_open_orders
+
 
 # ── Kolory arkuszy ────────────────────────────────────────────────────────────
 SHEET_COLORS = {
     "🚨 ZAMÓW DZIŚ":    "C0392B",   # czerwony
     "🟡 Zamów tydzień": "D4AC0D",   # żółty
     "🔵 W drodze":      "2980B9",   # niebieski
+    "🏭 Otwarte u dostawcy": "8E44AD",  # fioletowy
     "📈 Top movers":    "27AE60",   # zielony
     "⚫ Dead stock":    "555555",   # szary
     "📊 Pełna analiza": "2C3E50",   # granatowy
@@ -112,7 +115,7 @@ def _get_base_cols(analiza):
 
 def generate_full_excel(analiza, zam_df, summary):
     """
-    Generuje pełny raport Excel z 6 arkuszami.
+    Generuje pełny raport Excel z arkuszami.
     Returns: bytes (zawartość pliku .xlsx)
     """
     output = io.BytesIO()
@@ -123,6 +126,8 @@ def generate_full_excel(analiza, zam_df, summary):
     dos_col    = _find_col(analiza, "dostawca")
     grupa_col  = _find_col(analiza, "grupa")
 
+    supplier_open = summary.get("supplier_open_orders", {}) or {}
+
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
 
         # ── Arkusz 1: ZAMÓW DZIŚ ─────────────────────────────────────────────
@@ -130,16 +135,22 @@ def generate_full_excel(analiza, zam_df, summary):
             analiza[analiza["status"] == "ZAMÓW DZIŚ"]
             .sort_values("dni_do_wyczerpania")
         )
-        _write_sheet(writer, dzis, base_cols, "🚨 ZAMÓW DZIŚ")
+        _write_sheet_grouped_by_supplier(
+            writer, dzis, base_cols, dos_col,
+            "🚨 ZAMÓW DZIŚ", supplier_open,
+        )
 
         # ── Arkusz 2: Zamów tydzień ──────────────────────────────────────────
         tydzien = (
             analiza[analiza["status"] == "ZAMÓW TYDZIEŃ"]
             .sort_values("dni_do_wyczerpania")
         )
-        _write_sheet(writer, tydzien, base_cols, "🟡 Zamów tydzień")
+        _write_sheet_grouped_by_supplier(
+            writer, tydzien, base_cols, dos_col,
+            "🟡 Zamów tydzień", supplier_open,
+        )
 
-        # ── Arkusz 3: W drodze ───────────────────────────────────────────────
+        # ── Arkusz 3: W drodze (header zamówień) ────────────────────────────
         if zam_df is not None and len(zam_df) > 0:
             zam_clean = zam_df.drop(columns=["_data_realiz"], errors="ignore")
             zam_clean.to_excel(writer, sheet_name="🔵 W drodze", index=False)
@@ -147,6 +158,9 @@ def generate_full_excel(analiza, zam_df, summary):
             pd.DataFrame(
                 {"Info": ["Brak otwartych zamówień lub nie wgrano pliku"]}
             ).to_excel(writer, sheet_name="🔵 W drodze", index=False)
+
+        # ── Arkusz 3b: Otwarte u dostawcy (per dostawca → numery dokumentów) ─
+        _write_supplier_open_orders_sheet(writer, supplier_open)
 
         # ── Arkusz 4: Top movers ─────────────────────────────────────────────
         top_cols = [c for c in [
@@ -189,6 +203,12 @@ def generate_full_excel(analiza, zam_df, summary):
             if sheet_name in wb.sheetnames:
                 _style_sheet(wb[sheet_name], color)
 
+        # Pokoloruj wiersze-separatory (zaczynają się od "🏭 ") w arkuszach
+        # ZAMÓW DZIŚ / ZAMÓW TYDZIEŃ — żeby Anita wyraźnie widziała grupy
+        for sheet_name in ("🚨 ZAMÓW DZIŚ", "🟡 Zamów tydzień"):
+            if sheet_name in wb.sheetnames:
+                _style_supplier_separators(wb[sheet_name])
+
         # ── Arkusz podsumowania (na początku) ────────────────────────────────
         _add_summary_sheet(writer, summary)
         wb = writer.book
@@ -209,6 +229,112 @@ def _write_sheet(writer, df, cols, sheet_name):
     )
 
 
+def _write_sheet_grouped_by_supplier(
+    writer, df, cols, dos_col, sheet_name, supplier_open,
+):
+    """Jak _write_sheet, ale z grupowaniem per dostawca: między grupami
+    wstawiamy wiersz separatora z informacją o otwartych zamówieniach.
+
+    Format separatora: '🏭 DOSTAWCA — N otwart. zam. na X PLN (ZAZ/123, ZAZ/124)'
+
+    Daje Anitcie ekspresowy podgląd: zanim zacznie zamawiać u dostawcy,
+    widzi czy są tam już otwarte dokumenty (możliwość dorzucenia).
+    """
+    if df.empty or not dos_col or dos_col not in df.columns:
+        _write_sheet(writer, df, cols, sheet_name)
+        return
+
+    available = [c for c in cols if c in df.columns]
+
+    # Wytwórz blokowy DataFrame: każda grupa poprzedzona wierszem-separatorem
+    blocks = []
+    for dostawca, grupa in df.groupby(dos_col, sort=False):
+        info = lookup_supplier_open_orders(supplier_open, dostawca)
+        # Treść separatora w pierwszej kolumnie (nazwa towaru zwykle)
+        if info:
+            nrs = ", ".join(o["nr"] for o in info["orders"][:3])
+            if info["liczba_dokumentow"] > 3:
+                nrs += f" (+{info['liczba_dokumentow'] - 3} więcej)"
+            data_part = (
+                f", najbliższa: {info['najblizsza_data']}"
+                if info.get("najblizsza_data") else ""
+            )
+            separator_text = (
+                f"🏭 {dostawca}  •  🚚 MASZ JUŻ {info['liczba_dokumentow']} "
+                f"otwartych zamówień na {info['laczna_wartosc']:.0f} PLN "
+                f"({nrs}{data_part}) — możesz dorzucić te pozycje!"
+            )
+        else:
+            separator_text = f"🏭 {dostawca}  •  (brak otwartych zamówień u tego dostawcy)"
+
+        sep_row = {col: "" for col in available}
+        # Wstaw tekst do pierwszej kolumny — będzie widoczny w arkuszu
+        sep_row[available[0]] = separator_text
+        blocks.append(pd.DataFrame([sep_row]))
+        blocks.append(grupa[available])
+
+    combined = pd.concat(blocks, ignore_index=True)
+    combined.rename(columns=RENAME_MAP).to_excel(
+        writer, sheet_name=sheet_name, index=False
+    )
+
+
+def _write_supplier_open_orders_sheet(writer, supplier_open: dict) -> None:
+    """Dedykowany arkusz: dostawca → numery otwartych zamówień + ich SKU."""
+    if not supplier_open:
+        pd.DataFrame({"Info": ["Brak otwartych zamówień w iBiznes."]}).to_excel(
+            writer, sheet_name="🏭 Otwarte u dostawcy", index=False
+        )
+        return
+
+    rows = []
+    sorted_suppliers = sorted(
+        supplier_open.items(),
+        key=lambda kv: (-kv[1]["liczba_dokumentow"], -kv[1]["laczna_wartosc"]),
+    )
+    for _, info in sorted_suppliers:
+        nazwa = info["nazwa"]
+        n_dok = info["liczba_dokumentow"]
+        wartosc = info["laczna_wartosc"]
+        data = info.get("najblizsza_data") or ""
+
+        for o in info.get("orders", []):
+            skus = o.get("skus", []) or []
+            skus_preview = "; ".join(
+                f"{s.get('kod', '')} ({s.get('ilosc', 0):.0f}szt)"
+                for s in skus[:8]
+            )
+            if len(skus) > 8:
+                skus_preview += f"; +{len(skus) - 8} więcej"
+            rows.append({
+                "Dostawca":           nazwa,
+                "Otwartych dok.":     n_dok,
+                "Łączna wart. PLN":   wartosc,
+                "Najbliższa dostawa": data,
+                "Nr Zamówienia":      o.get("nr", ""),
+                "Data realizacji":    o.get("data_realiz", ""),
+                "Wartość dok. PLN":   o.get("wartosc", 0),
+                "Liczba pozycji":     len(skus),
+                "SKU w dokumencie":   skus_preview,
+            })
+
+    pd.DataFrame(rows).to_excel(
+        writer, sheet_name="🏭 Otwarte u dostawcy", index=False
+    )
+
+
+def _style_supplier_separators(ws):
+    """Koloruje wiersze rozpoczynające się od '🏭 ' (separator per dostawca)."""
+    sep_fill = PatternFill(start_color="E8DAEF", end_color="E8DAEF", fill_type="solid")
+    sep_font = Font(bold=True, color="4A235A", size=10)
+    for row in ws.iter_rows(min_row=2):
+        first_val = row[0].value
+        if isinstance(first_val, str) and first_val.startswith("🏭 "):
+            for cell in row:
+                cell.fill = sep_fill
+                cell.font = sep_font
+
+
 def _add_summary_sheet(writer, summary):
     """Dodaje arkusz podsumowania z kluczowymi metrykami."""
     data = {
@@ -222,6 +348,7 @@ def _add_summary_sheet(writer, summary):
             "─────────────",
             "Pozycji w drodze od dostawców",
             "Wartość zamówień w drodze",
+            "Dostawców z otwartymi zamówieniami",
             "─────────────",
             "Produktów do zamówienia DZIŚ",
             "Wartość zamówień DZIŚ",
@@ -241,6 +368,7 @@ def _add_summary_sheet(writer, summary):
             "",
             summary.get("produktow_w_drodze", 0),
             f"{summary.get('wartosc_w_drodze', 0):,.0f} PLN".replace(",", " "),
+            summary.get("dostawcow_z_otwartymi", 0),
             "",
             summary["produktow_dzis"],
             f"{summary['wartosc_dzis']:,.0f} PLN".replace(",", " "),
@@ -256,9 +384,16 @@ def _add_summary_sheet(writer, summary):
     )
 
 
-def generate_order_excel(analiza):
+def generate_order_excel(analiza, summary=None):
     """
     Generuje prostą listę zamówień (plik do wgrania do iBiznes).
+
+    Args:
+        analiza: pełen DataFrame z wynikami analizy
+        summary: opcjonalny dict z 'supplier_open_orders' — gdy podany,
+                 dodajemy kolumnę "Otwarte u dostawcy" z numerami dokumentów,
+                 do których Anita może dorzucić nowe pozycje.
+
     Returns: bytes
     """
     output = io.BytesIO()
@@ -276,6 +411,21 @@ def generate_order_excel(analiza):
         {"ZAMÓW DZIŚ": "DZIŚ", "ZAMÓW TYDZIEŃ": "TYDZIEŃ"}
     )
 
+    # Wstrzykuj informację "otwarte u dostawcy" jako tekstową kolumnę
+    supplier_open = (summary or {}).get("supplier_open_orders", {}) or {}
+    if supplier_open and dos_col and dos_col in to_order.columns:
+        def _otwarte_hint(d):
+            info = lookup_supplier_open_orders(supplier_open, d)
+            if not info:
+                return ""
+            nrs = ", ".join(o["nr"] for o in info["orders"][:3])
+            if info["liczba_dokumentow"] > 3:
+                nrs += f" +{info['liczba_dokumentow'] - 3}"
+            data = info.get("najblizsza_data") or ""
+            data_part = f" (do {data})" if data else ""
+            return f"{info['liczba_dokumentow']}× {nrs}{data_part}"
+        to_order["Otwarte u dostawcy"] = to_order[dos_col].apply(_otwarte_hint)
+
     col_map = {}
     for src, dst in [
         (kod_col,   "Kod towaru"),
@@ -284,6 +434,7 @@ def generate_order_excel(analiza):
         (jm_col, "JM"),
         ("Cena zakupu netto", "Cena zakupu netto"),
         (dos_col, "Dostawca"),
+        ("Otwarte u dostawcy", "Otwarte u dostawcy"),
         ("Priorytet", "Priorytet"),
     ]:
         if src and src in to_order.columns:

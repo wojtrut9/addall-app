@@ -3,6 +3,7 @@ engine.py — Add All Inventory Analysis Engine
 Logika analizy: czyta pliki, liczy metryki, generuje rekomendacje.
 """
 import io
+import re
 import warnings
 from datetime import datetime
 
@@ -116,7 +117,14 @@ def find_col(df, *hints):
     return None
 
 
-def analyze(kart_file, obroty_file, zam_file=None, min_log_file=None, in_transit_df=None):
+def analyze(
+    kart_file,
+    obroty_file,
+    zam_file=None,
+    min_log_file=None,
+    in_transit_df=None,
+    open_orders_lines_df=None,
+):
     """
     Główna funkcja analizy.
 
@@ -129,6 +137,10 @@ def analyze(kart_file, obroty_file, zam_file=None, min_log_file=None, in_transit
             (kolumny: Kod towaru, w_drodze, wartosc_w_drodze).
             Jeśli podany, zamówienia w drodze są odejmowane od rekomendacji
             "ile zamówić".
+        open_orders_lines_df: opcjonalny DataFrame z LINE ITEMS otwartych
+            zamówień (kolumny: Kod towaru, Nazwa, Dostawca, Nr Zamówienia,
+            Data realiz., ilosc, wartosc). Używane do podpinania "u tego
+            dostawcy masz już otwarte zamówienie X — możesz dorzucić".
 
     Returns:
         analiza (DataFrame), zam_df (DataFrame|None),
@@ -353,11 +365,23 @@ def analyze(kart_file, obroty_file, zam_file=None, min_log_file=None, in_transit
         try:
             zam_df = read_uploaded_file(zam_file)
             for col in zam_df.columns:
-                if "data" in col.lower() or "realiz" in col.lower():
+                if "realiz" in col.lower():
                     zam_df["_data_realiz"] = zam_df[col].apply(parse_polish_date)
                     break
+            if "_data_realiz" not in zam_df.columns:
+                # Fallback: jakakolwiek kolumna z datą
+                for col in zam_df.columns:
+                    if "data" in col.lower():
+                        zam_df["_data_realiz"] = zam_df[col].apply(parse_polish_date)
+                        break
         except Exception:
             zam_df = None
+
+    # ── 9a. Mapowanie dostawca → lista otwartych zamówień ──────────────────
+    # Klucz biznesowy: gdy Anita widzi "Zamów X u BIACHEM" musi wiedzieć
+    # że u BIACHEM jest już otwarte zamówienie ZAZ/123/2026 — żeby mogła
+    # dorzucić nowe pozycje zamiast tworzyć osobny dokument.
+    supplier_open_orders = _build_supplier_open_orders(zam_df, open_orders_lines_df)
 
     # ── 10. Summary dict ─────────────────────────────────────────────────────
     dzis = analiza[analiza["status"] == "ZAMÓW DZIŚ"]
@@ -396,10 +420,213 @@ def analyze(kart_file, obroty_file, zam_file=None, min_log_file=None, in_transit
         "data_od": date_min.strftime("%d.%m.%Y"),
         "data_do": date_max.strftime("%d.%m.%Y"),
         "min_log": min_log,
+        # Mapowanie DOSTAWCA → lista otwartych zamówień u niego.
+        # Pozwala podpiąć rekomendację "zamów X u BIACHEM" do istniejącego
+        # dokumentu ZAZ/123/2026 zamiast tworzyć nowy.
+        "supplier_open_orders": supplier_open_orders,
+        # Liczba dostawców u których są otwarte dokumenty
+        "dostawcow_z_otwartymi": len(supplier_open_orders),
     }
 
     context = _build_llm_context(analiza, zam_df, summary)
     return analiza, zam_df, summary, context
+
+
+# ── Mapowanie dostawca → otwarte zamówienia ───────────────────────────────────
+
+def _norm_supplier_name(x: str) -> str:
+    """Uppercase + pojedyncze spacje — używane do dopasowania nazw między
+    kartoteką a zamówieniami."""
+    return re.sub(r"\s+", " ", str(x).strip().upper())
+
+
+def lookup_supplier_open_orders(
+    supplier_open: dict | None,
+    dostawca_name: str | None,
+) -> dict | None:
+    """Znajduje wpis o otwartych zamówieniach dla nazwy dostawcy z kartoteki.
+
+    Najpierw dokładny klucz UPPER, potem ta sama nazwa po normalizacji spacji,
+    na końcu luźne dopasowanie „jedna nazwa zawiera drugą” (≥ 6 znaków).
+    """
+    if not supplier_open or dostawca_name is None:
+        return None
+    if isinstance(dostawca_name, float) and pd.isna(dostawca_name):
+        return None
+    raw = str(dostawca_name).strip()
+    if not raw or raw.lower() == "nan":
+        return None
+
+    k = raw.upper()
+    if k in supplier_open:
+        return supplier_open[k]
+
+    nk = _norm_supplier_name(raw)
+    for key_u, info in supplier_open.items():
+        if _norm_supplier_name(info.get("nazwa", key_u)) == nk:
+            return info
+
+    for info in supplier_open.values():
+        name = _norm_supplier_name(info.get("nazwa", ""))
+        if len(nk) >= 6 and len(name) >= 6 and (nk in name or name in nk):
+            return info
+    return None
+
+
+def _merge_open_orders_header_into_map(result: dict, zam_df) -> None:
+    """Dopisuje dokumenty z nagłówka zamówień (CSV / fetch_zamowienia).
+
+    Wywoływane ZAWSZE gdy mamy `zam_df` — wcześniej nagłówek był pomijany,
+    jeśli istniały line items z SQL, przez co w UI znikały numery dokumentów
+    gdy JOIN pozycji nie zwracał pełnych danych."""
+    if zam_df is None or len(zam_df) == 0:
+        return
+    df = zam_df.copy()
+    dos_col = find_col(df, "dostawca")
+    nr_col = find_col(df, "nr zamówienia", "nr zam")
+    if not dos_col or not nr_col:
+        return
+    war_col = find_col(df, "wartość", "wartosc")
+    data_col = find_col(df, "data realiz")
+
+    df[dos_col] = df[dos_col].astype(str).str.strip()
+
+    for _, row in df.iterrows():
+        dostawca = str(row.get(dos_col, "")).strip()
+        if not dostawca or dostawca.lower() == "nan":
+            continue
+        key = dostawca.upper()
+        nr = str(row.get(nr_col, "")).strip()
+        if not nr or nr.lower() == "nan":
+            continue
+
+        supplier = result.setdefault(key, {
+            "nazwa": dostawca,
+            "orders": [],
+            "kody_w_drodze": set(),
+        })
+        existing = {o["nr"] for o in supplier["orders"]}
+        if nr in existing:
+            continue
+
+        wartosc_raw = row.get(war_col, 0) if war_col else 0
+        try:
+            wartosc = float(
+                str(wartosc_raw).replace(",", ".").replace(" ", "").replace("\xa0", "")
+            )
+        except (ValueError, TypeError):
+            wartosc = 0.0
+
+        supplier["orders"].append({
+            "nr": nr,
+            "data_realiz": str(row.get(data_col, "")) if data_col else "",
+            "wartosc": round(wartosc, 2),
+            "skus": [],
+        })
+
+
+def _build_supplier_open_orders(zam_df, open_orders_lines_df) -> dict:
+    """
+    Buduje słownik: { 'DOSTAWCA' (upper): {
+        'orders': [{'nr': str, 'data_realiz': str, 'wartosc': float,
+                    'skus': [{'kod': str, 'nazwa': str, 'ilosc': float}]}],
+        'liczba_dokumentow': int,
+        'laczna_wartosc': float,
+        'najblizsza_data': str | None,
+        'kody_w_drodze': set[str],
+    }}
+
+    Source of truth:
+    - line items z SQL (jeśli są) — SKU i wartości z pozycji
+    - nagłówek zamówień (`zam_df`) jest **zawsze** mergowany — numery dokumentów
+      jak w iBiznes nawet gdy JOIN pozycji zwraca niepełne dane
+
+    Wynik trafia do summary i jest używany przez:
+    - _build_llm_context (sekcja "POŁĄCZ Z OTWARTYMI ZAMÓWIENIAMI")
+    - UI w app.py (baner przy każdym dostawcy w "Zamów dziś")
+    - AI agent (tool get_open_orders_for_supplier)
+    """
+    result: dict[str, dict] = {}
+
+    # ── 1. Line items (jeśli są) — preferowane źródło ───────────────────
+    if open_orders_lines_df is not None and len(open_orders_lines_df) > 0:
+        df = open_orders_lines_df.copy()
+        dos_col = find_col(df, "dostawca")
+        nr_col  = find_col(df, "nr zamówienia", "nr zam")
+        data_col = find_col(df, "data realiz", "data dost")
+        kod_col = find_col(df, "kod towaru / usługi", "kod towaru")
+        if kod_col is None and "Kod towaru" in df.columns:
+            kod_col = "Kod towaru"
+        nazwa_col = find_col(df, "nazwa towaru", "nazwa")
+        il_col   = find_col(df, "ilosc", "ilość")
+        war_col  = find_col(df, "wartosc", "wartość")
+
+        if dos_col and nr_col:
+            df[dos_col] = df[dos_col].astype(str).str.strip()
+            # Grupuj per (dostawca, nr_zamowienia) → orders
+            for (dostawca, nr_zam), grp in df.groupby([dos_col, nr_col]):
+                if not str(dostawca).strip() or str(dostawca).strip().lower() == "nan":
+                    continue
+                key = str(dostawca).strip().upper()
+                supplier = result.setdefault(key, {
+                    "nazwa": str(dostawca).strip(),
+                    "orders": [],
+                    "kody_w_drodze": set(),
+                })
+
+                data_real = ""
+                if data_col and data_col in grp.columns:
+                    raw = grp[data_col].iloc[0]
+                    data_real = str(raw) if pd.notna(raw) else ""
+
+                skus = []
+                for _, row in grp.iterrows():
+                    kod = str(row.get(kod_col, "")).strip() if kod_col else ""
+                    if not kod:
+                        continue
+                    ilosc = float(row.get(il_col, 0) or 0) if il_col else 0.0
+                    skus.append({
+                        "kod":   kod,
+                        "nazwa": str(row.get(nazwa_col, "")) if nazwa_col else "",
+                        "ilosc": ilosc,
+                    })
+                    supplier["kody_w_drodze"].add(kod)
+
+                wartosc = float(grp[war_col].sum()) if war_col and war_col in grp.columns else 0.0
+
+                supplier["orders"].append({
+                    "nr": str(nr_zam),
+                    "data_realiz": data_real,
+                    "wartosc": round(wartosc, 2),
+                    "skus": skus,
+                })
+
+    # ── 2. ZAWSZE dopisz nagłówek (lista dokumentów jak w iBiznes) ─────────
+    # Nawet jeśli pozycje z SQL się udały — uzupełnia braki i gwarantuje
+    # widoczność numerów ZAZ/… w UI.
+    _merge_open_orders_header_into_map(result, zam_df)
+
+    # ── 3. Dodaj zagregowane metryki + znajdź najbliższą datę ───────────
+    for key, supplier in result.items():
+        supplier["liczba_dokumentow"] = len(supplier["orders"])
+        supplier["laczna_wartosc"] = round(
+            sum(o.get("wartosc", 0) for o in supplier["orders"]), 2
+        )
+        # Najbliższa data realizacji — parsuj polski format
+        daty = []
+        for o in supplier["orders"]:
+            dt = parse_polish_date(o.get("data_realiz", ""))
+            if pd.notna(dt):
+                daty.append(dt)
+        if daty:
+            najblizsza = min(daty)
+            supplier["najblizsza_data"] = najblizsza.strftime("%d.%m.%Y")
+        else:
+            supplier["najblizsza_data"] = None
+        # kody_w_drodze jest set'em — JSON serializacja wymaga list
+        supplier["kody_w_drodze"] = sorted(supplier["kody_w_drodze"])
+
+    return result
 
 
 # ── LLM context builder ───────────────────────────────────────────────────────
@@ -438,6 +665,27 @@ def _build_llm_context(analiza, zam_df, summary):
         "",
     ]
 
+    supplier_open = summary.get("supplier_open_orders", {}) or {}
+
+    def _open_orders_hint(dostawca_name: str) -> str:
+        """Zwraca podpowiedź 'masz już otwarte zamówienie u tego dostawcy'.
+        Pusty string jeśli nie ma."""
+        info = lookup_supplier_open_orders(supplier_open, dostawca_name)
+        if not info:
+            return ""
+        liczba = info["liczba_dokumentow"]
+        wartosc = info["laczna_wartosc"]
+        nr_lista = ", ".join(o["nr"] for o in info["orders"][:3])
+        if liczba > 3:
+            nr_lista += f", +{liczba - 3} więcej"
+        data = info.get("najblizsza_data")
+        data_part = f" (najbliższa dostawa: {data})" if data else ""
+        return (
+            f" ⚠ MASZ JUŻ {liczba} OTWARTYCH ZAMÓWIEŃ u tego dostawcy "
+            f"na {wartosc:.0f} PLN: {nr_lista}{data_part} — "
+            f"MOŻESZ DORZUCIĆ NOWE POZYCJE do istniejącego dokumentu zamiast tworzyć nowy."
+        )
+
     # Zamów dziś
     lines.append("[SEKCJA: ZAMÓW DZIŚ]")
     dzis = analiza[analiza["status"] == "ZAMÓW DZIŚ"].sort_values("dni_do_wyczerpania")
@@ -455,6 +703,9 @@ def _build_llm_context(analiza, zam_df, summary):
                     else f"BRAKUJE {min_v - razem:.0f} PLN do minimum ({min_v:.0f} PLN)"
                 )
                 lines.append(f"\nDostawca: {dostawca} — {razem:.0f} PLN | {status_min}")
+                hint = _open_orders_hint(dostawca)
+                if hint:
+                    lines.append(f"  {hint}")
                 for _, r in g.iterrows():
                     lines.append(
                         f"  - {prod_name(r)} | stan {r['Stan']:.0f} + w drodze {r['w_drodze']:.0f} = "
@@ -476,15 +727,30 @@ def _build_llm_context(analiza, zam_df, summary):
         lines.append("Brak.")
     else:
         lines.append(f"Razem: {len(tydzien)} pozycji, łącznie {tydzien['wartosc_zamowienia'].sum():.0f} PLN.")
-        # Limit do 50 pozycji żeby kontekst nie eksplodował
-        for _, r in tydzien.head(50).iterrows():
-            d = r.get(dostawca_col, "N/A") if dostawca_col else "N/A"
-            lines.append(
-                f"  - {prod_name(r)} ({d}) — {r['dni_do_wyczerpania']:.0f} dni, "
-                f"zamów {r['ile_zamowic']} szt za {r['wartosc_zamowienia']:.0f} PLN"
-            )
-        if len(tydzien) > 50:
-            lines.append(f"  ... i {len(tydzien) - 50} kolejnych (pełna lista w tabeli/Excelu).")
+        # Grupowanie per dostawca — żeby Anita widziała ile pozycji na firmę
+        # i jakie ma już otwarte zamówienia (możliwość dorzucenia)
+        if dostawca_col:
+            for dostawca, g in tydzien.groupby(dostawca_col):
+                razem = g["wartosc_zamowienia"].sum()
+                lines.append(f"\nDostawca: {dostawca} — {len(g)} poz., {razem:.0f} PLN")
+                hint = _open_orders_hint(dostawca)
+                if hint:
+                    lines.append(f"  {hint}")
+                for _, r in g.head(20).iterrows():
+                    lines.append(
+                        f"  - {prod_name(r)} | starczy {r['dni_do_wyczerpania']:.0f} dni | "
+                        f"zamów {r['ile_zamowic']} szt za {r['wartosc_zamowienia']:.0f} PLN"
+                    )
+                if len(g) > 20:
+                    lines.append(f"  ... i {len(g) - 20} kolejnych pozycji u tego dostawcy")
+        else:
+            for _, r in tydzien.head(50).iterrows():
+                lines.append(
+                    f"  - {prod_name(r)} — {r['dni_do_wyczerpania']:.0f} dni, "
+                    f"zamów {r['ile_zamowic']} szt za {r['wartosc_zamowienia']:.0f} PLN"
+                )
+            if len(tydzien) > 50:
+                lines.append(f"  ... i {len(tydzien) - 50} kolejnych (pełna lista w tabeli/Excelu).")
 
     # W drodze (per SKU)
     in_transit = analiza[analiza["w_drodze"] > 0].sort_values("w_drodze", ascending=False)
@@ -499,6 +765,37 @@ def _build_llm_context(analiza, zam_df, summary):
             )
         if len(in_transit) > 20:
             lines.append(f"  ... i {len(in_transit) - 20} kolejnych pozycji.")
+
+    # Otwarte zamówienia per dostawca — kluczowy widok dla Anity
+    # Pokazuje: u kogo masz aktywne dokumenty + jakie SKU już jadą
+    # (dzięki temu wie, że nowe pozycje może DORZUCIĆ a nie tworzyć osobne)
+    if supplier_open:
+        lines.append("\n[SEKCJA: OTWARTE ZAMÓWIENIA U DOSTAWCÓW — gdzie można DORZUCIĆ]")
+        # Posortuj po liczbie dokumentów malejąco
+        sorted_suppliers = sorted(
+            supplier_open.items(),
+            key=lambda kv: (-kv[1]["liczba_dokumentow"], -kv[1]["laczna_wartosc"]),
+        )
+        for _, info in sorted_suppliers[:15]:
+            nazwa = info["nazwa"]
+            data = info.get("najblizsza_data")
+            data_part = f", najbliższa dostawa: {data}" if data else ""
+            lines.append(
+                f"\n• {nazwa}: {info['liczba_dokumentow']} otwart. zam., "
+                f"łącznie {info['laczna_wartosc']:.0f} PLN{data_part}"
+            )
+            # Pokaż numery dokumentów + ile SKU w każdym
+            for o in info["orders"][:5]:
+                sku_count = len(o.get("skus", []))
+                sku_part = f" ({sku_count} pozycji)" if sku_count else ""
+                data_real = f", real.: {o['data_realiz']}" if o.get("data_realiz") else ""
+                lines.append(
+                    f"    - {o['nr']}{sku_part}{data_real} — {o['wartosc']:.0f} PLN"
+                )
+            if info["liczba_dokumentow"] > 5:
+                lines.append(f"    ... i {info['liczba_dokumentow'] - 5} kolejnych dokumentów")
+        if len(sorted_suppliers) > 15:
+            lines.append(f"\n... i {len(sorted_suppliers) - 15} kolejnych dostawców z otwartymi zamówieniami.")
 
     # Top 10 fast movers
     lines.append("\n[SEKCJA: TOP 10 NAJSZYBCIEJ SCHODZĄCYCH]")

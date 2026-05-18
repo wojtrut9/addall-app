@@ -518,14 +518,40 @@ def _remap_kartoteka(df: pd.DataFrame) -> pd.DataFrame:
 
 # ── Fetch: Zamówienia do dostawców ────────────────────────────────────────────
 
+# Etap zamówień iBiznes — kody które OZNACZAJĄ "zamknięte / nieaktywne":
+#   Z = zrealizowane, A = anulowane, X = wycofane, K = zakończone, 9 = stop
+# Wszystkie inne (N=nowe, B=bufor/bieżące, C=częściowe, P=potwierdzone,
+#   puste/NULL, 0, 1) traktujemy jako OTWARTE.
+# Filtrujemy "negatywnie" (NOT IN), żeby nie przegapić wariantów etapu które
+# iBiznes wprowadza w aktualizacjach.
+_ETAP_ZAMKNIETE = ("Z", "A", "X", "K", "9", "z", "a", "x", "k")
+
+
+def _build_open_orders_where(etap_col: str) -> str:
+    """Zwraca WHERE wybierający otwarte (niezrealizowane) zamówienia."""
+    placeholders = ", ".join(f"'{e}'" for e in _ETAP_ZAMKNIETE)
+    return (
+        f" WHERE (`{etap_col}` IS NULL "
+        f"OR TRIM(CAST(`{etap_col}` AS CHAR)) = '' "
+        f"OR UPPER(TRIM(CAST(`{etap_col}` AS CHAR))) NOT IN ({placeholders.upper()}))"
+    )
+
+
 def fetch_zamowienia(
     conn: pymysql.Connection,
     tbl_info: dict,
 ) -> pd.DataFrame:
     """
-    Pobiera otwarte zamówienia do dostawców.
+    Pobiera otwarte zamówienia do dostawców (tablica "Zamówienia do dostawców"
+    z iBiznes — ta z 18 pozycjami "w realizacji").
+
+    Filtrowanie: bierzemy WSZYSTKO co NIE JEST zrealizowane/anulowane
+    (Etap NOT IN Z/A/X/K). To pokrywa zarówno zamówienia nowe ('N'),
+    częściowo zrealizowane ('C'), potwierdzone ('P'), w buforze ('B'),
+    jak i te z pustym etapem.
+
     Zwraca DataFrame z kolumnami jak ZamówieniaDlaDostawcy.csv:
-    Nr Zamówienia | Dostawca | Wartość | Data realiz. | etap
+    Nr Zamówienia | Dostawca | Wartość | Data realiz. | Data utworzenia | etap
     """
     frames = []
 
@@ -539,28 +565,28 @@ def fetch_zamowienia(
         nr_col    = _pick_col(cols, "NrZ", "Nr", "Numer", "NrZam", "NrDoc")
         dos_col   = _pick_col(cols, "Dostawca", "Alias", "Kontrahent", "Supplier")
         war_col   = _pick_col(cols, "Wartosc", "Wartość", "Kwota", "Suma", "Brutto", "Netto")
-        data_col  = _pick_col(cols, "DataReal", "DataRealizacji", "DataDost", "DataZam", "Data")
+        data_real_col  = _pick_col(cols, "DataReal", "DataRealizacji", "DataDost", "DataZam")
+        data_utw_col   = _pick_col(cols, "DataUtw", "DataWyst", "DataDok", "Data")
         etap_col  = _pick_col(cols, "Etap", "Status", "Stan", "Realizacja")
 
         if not nr_col:
             continue
 
         select_parts = [f"`{nr_col}` AS `Nr Zamówienia`"]
-        if dos_col:  select_parts.append(f"`{dos_col}` AS `Dostawca`")
-        else:         select_parts.append("'' AS `Dostawca`")
-        if war_col:  select_parts.append(f"`{war_col}` AS `Wartość`")
-        else:         select_parts.append("0 AS `Wartość`")
-        if data_col: select_parts.append(f"`{data_col}` AS `Data realiz.`")
-        else:         select_parts.append("'' AS `Data realiz.`")
-        if etap_col: select_parts.append(f"`{etap_col}` AS `etap`")
-        else:         select_parts.append("'N' AS `etap`")
+        if dos_col:        select_parts.append(f"`{dos_col}` AS `Dostawca`")
+        else:               select_parts.append("'' AS `Dostawca`")
+        if war_col:        select_parts.append(f"`{war_col}` AS `Wartość`")
+        else:               select_parts.append("0 AS `Wartość`")
+        if data_real_col:  select_parts.append(f"`{data_real_col}` AS `Data realiz.`")
+        else:               select_parts.append("'' AS `Data realiz.`")
+        if data_utw_col:   select_parts.append(f"`{data_utw_col}` AS `Data utworzenia`")
+        else:               select_parts.append("'' AS `Data utworzenia`")
+        if etap_col:       select_parts.append(f"`{etap_col}` AS `etap`")
+        else:               select_parts.append("'N' AS `etap`")
 
-        # Tylko niezrealizowane (Etap IN ('N','B') lub analogiczne)
-        where_clause = ""
-        if etap_col:
-            where_clause = f"WHERE `{etap_col}` IN ('N', 'B', 'n', 'b', 0, 1)"
+        where_clause = _build_open_orders_where(etap_col) if etap_col else ""
 
-        sql = f"SELECT {', '.join(select_parts)} FROM `{tbl}` {where_clause}"
+        sql = f"SELECT {', '.join(select_parts)} FROM `{tbl}`{where_clause}"
 
         try:
             df = _q(conn, sql)
@@ -575,9 +601,19 @@ def fetch_zamowienia(
                 pass
 
     if not frames:
-        return pd.DataFrame(columns=["Nr Zamówienia", "Dostawca", "Wartość", "Data realiz.", "etap"])
+        return pd.DataFrame(columns=[
+            "Nr Zamówienia", "Dostawca", "Wartość",
+            "Data realiz.", "Data utworzenia", "etap",
+        ])
 
-    return pd.concat(frames, ignore_index=True)
+    result = pd.concat(frames, ignore_index=True)
+
+    # Konwertuj daty iBiznes (YYYYMMDD) na polski format dla czytelności
+    for col in ("Data realiz.", "Data utworzenia"):
+        if col in result.columns:
+            result[col] = result[col].apply(_ibiznes_date_to_polish)
+
+    return result
 
 
 # ── Fetch: Pozycje otwartych zamówień (in-transit per SKU) ────────────────────
@@ -649,10 +685,14 @@ def fetch_in_transit_lines(
                 join_clause = (
                     f" JOIN `{head_tbl}` h ON s.`{nrz_col}` = h.`{head_nrz}`"
                 )
-                # Otwarte = niezrealizowane (Etap N/B/0/1 lub puste)
+                # Otwarte = wszystko poza zrealizowane/anulowane.
+                # Filtrujemy negatywnie (NOT IN ('Z','A','X','K')) żeby nie
+                # przegapić częściowo zrealizowanych ('C') ani potwierdzonych ('P').
+                placeholders = ", ".join(f"'{e.upper()}'" for e in _ETAP_ZAMKNIETE)
                 where_clause = (
                     f" WHERE (h.`{etap_col}` IS NULL "
-                    f"OR UPPER(TRIM(CAST(h.`{etap_col}` AS CHAR))) IN ('N','B','NOWE','0','1',''))"
+                    f"OR TRIM(CAST(h.`{etap_col}` AS CHAR)) = '' "
+                    f"OR UPPER(TRIM(CAST(h.`{etap_col}` AS CHAR))) NOT IN ({placeholders}))"
                 )
 
         sql = (
@@ -688,18 +728,127 @@ def fetch_in_transit_lines(
     )
 
 
+# ── Fetch: Line items otwartych zamówień Z DOSTAWCĄ ──────────────────────────
+
+def fetch_open_orders_with_lines(
+    conn: pymysql.Connection,
+    tbl_info: dict,
+) -> pd.DataFrame:
+    """
+    Pobiera SZCZEGÓŁOWE pozycje otwartych zamówień do dostawców — każdy wiersz
+    to JEDEN SKU w JEDNYM dokumencie zamówienia, z nazwą dostawcy i datą realiz.
+
+    To jest klucz do funkcji "u tego dostawcy masz już otwarte zamówienie X
+    — możesz dorzucić nowe pozycje zamiast robić osobny dokument".
+
+    Zwraca DataFrame:
+        Kod towaru | Nazwa | Dostawca | Nr Zamówienia | Data realiz.
+        | ilosc | wartosc
+
+    Pusty DataFrame jeśli tabel nie ma lub brak otwartych zamówień.
+    """
+    frames = []
+
+    pairs = [
+        (tbl_info.get("zamspec_spzoo"), tbl_info.get("zam_spzoo")),
+        (tbl_info.get("zamspec_firma"), tbl_info.get("zam_firma")),
+    ]
+
+    for spec_tbl, head_tbl in pairs:
+        if not spec_tbl or not head_tbl:
+            continue
+
+        try:
+            spec_cols = get_columns(conn, spec_tbl)
+            head_cols = get_columns(conn, head_tbl)
+        except Exception:
+            continue
+
+        kod_col   = _pick_col(spec_cols, *_KOD_HINTS)
+        nazwa_col = _pick_col(spec_cols, *_NAZWA_HINTS)
+        il_col    = _pick_col(spec_cols, "Il", "Ilosc", "Qty", "Quantity")
+        cena_col  = _pick_col(spec_cols, *_CENA_Z_HINTS) or _pick_col(spec_cols, "Cena", "Cb")
+        nrz_spec  = _pick_col(spec_cols, "NrZ", "Nr", "Numer", "NrZam", "NrDoc", "NrR")
+
+        nrz_head  = _pick_col(head_cols, "NrZ", "Nr", "Numer", "NrZam", "NrDoc", "NrR")
+        dos_head  = _pick_col(head_cols, "Dostawca", "Alias", "Kontrahent", "Supplier")
+        data_head = _pick_col(head_cols, "DataReal", "DataRealizacji", "DataDost", "DataZam")
+        etap_head = _pick_col(head_cols, "Etap", "Status", "Stan", "Realizacja")
+
+        if not kod_col or not il_col or not nrz_spec or not nrz_head:
+            continue
+
+        select_parts = [
+            f"s.`{kod_col}` AS `Kod towaru`",
+            (f"s.`{nazwa_col}` AS `Nazwa`" if nazwa_col else "'' AS `Nazwa`"),
+            (f"h.`{dos_head}` AS `Dostawca`" if dos_head else "'' AS `Dostawca`"),
+            f"h.`{nrz_head}` AS `Nr Zamówienia`",
+            (f"h.`{data_head}` AS `Data realiz.`" if data_head else "'' AS `Data realiz.`"),
+            f"CAST(REPLACE(REPLACE(CAST(s.`{il_col}` AS CHAR), ',', '.'), ' ', '') AS DECIMAL(18,3)) AS `ilosc`",
+            (
+                f"CAST(REPLACE(REPLACE(CAST(s.`{il_col}` AS CHAR), ',', '.'), ' ', '') AS DECIMAL(18,3)) * "
+                f"CAST(REPLACE(REPLACE(CAST(s.`{cena_col}` AS CHAR), ',', '.'), ' ', '') AS DECIMAL(18,4)) AS `wartosc`"
+                if cena_col else "0 AS `wartosc`"
+            ),
+        ]
+
+        where_clause = ""
+        if etap_head:
+            placeholders = ", ".join(f"'{e.upper()}'" for e in _ETAP_ZAMKNIETE)
+            where_clause = (
+                f" WHERE (h.`{etap_head}` IS NULL "
+                f"OR TRIM(CAST(h.`{etap_head}` AS CHAR)) = '' "
+                f"OR UPPER(TRIM(CAST(h.`{etap_head}` AS CHAR))) NOT IN ({placeholders}))"
+            )
+
+        sql = (
+            f"SELECT {', '.join(select_parts)} "
+            f"FROM `{spec_tbl}` s "
+            f"JOIN `{head_tbl}` h ON s.`{nrz_spec}` = h.`{nrz_head}`"
+            f"{where_clause}"
+        )
+
+        try:
+            df = _q(conn, sql)
+            if not df.empty:
+                df["ilosc"]   = pd.to_numeric(df["ilosc"], errors="coerce").fillna(0)
+                df["wartosc"] = pd.to_numeric(df["wartosc"], errors="coerce").fillna(0)
+                df = df[df["ilosc"] > 0]
+                if not df.empty:
+                    if "Data realiz." in df.columns:
+                        df["Data realiz."] = df["Data realiz."].apply(_ibiznes_date_to_polish)
+                    frames.append(df)
+        except Exception:
+            pass
+
+    if not frames:
+        return pd.DataFrame(columns=[
+            "Kod towaru", "Nazwa", "Dostawca",
+            "Nr Zamówienia", "Data realiz.", "ilosc", "wartosc",
+        ])
+
+    return pd.concat(frames, ignore_index=True)
+
+
 # ── Główna funkcja: pobierz wszystko ─────────────────────────────────────────
 
 def fetch_all(
     db_url: str,
     days: int = 90,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
     """
     Główna funkcja — łączy się z iBiznes i pobiera wszystkie dane.
 
     Returns:
-        (kartoteka_df, obroty_df, zamowienia_df, in_transit_df, tbl_info)
-        gdzie tbl_info zawiera m.in. '_all_tables' do debugowania.
+        (kartoteka_df, obroty_df, zamowienia_df, in_transit_df,
+         open_orders_lines_df, tbl_info)
+
+        - zamowienia_df:  header otwartych zamówień (1 wiersz = 1 dokument)
+        - in_transit_df:  agregat per SKU (w_drodze sumarycznie)
+        - open_orders_lines_df: line items per (Nr zam., SKU, dostawca)
+          — pozwala powiedzieć "u dostawcy X masz już otwarte zamówienie Y
+          z produktami A, B — możesz dorzucić nowe pozycje".
+        - tbl_info zawiera m.in. '_all_tables' do debugowania.
     """
     conn = get_connection(db_url)
     try:
@@ -708,7 +857,8 @@ def fetch_all(
         obroty     = fetch_obroty(conn, tbl_info, days=days)
         zamowienia = fetch_zamowienia(conn, tbl_info)
         in_transit = fetch_in_transit_lines(conn, tbl_info)
+        open_lines = fetch_open_orders_with_lines(conn, tbl_info)
     finally:
         conn.close()
 
-    return kartoteka, obroty, zamowienia, in_transit, tbl_info
+    return kartoteka, obroty, zamowienia, in_transit, open_lines, tbl_info

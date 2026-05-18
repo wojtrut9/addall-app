@@ -7,9 +7,10 @@ Interfejs Streamlit z dwoma trybami:
 import os
 from datetime import datetime
 
+import pandas as pd
 import streamlit as st
 
-from engine import analyze
+from engine import analyze, lookup_supplier_open_orders
 from excel_export import generate_full_excel, generate_order_excel
 
 # ── Konfiguracja strony ───────────────────────────────────────────────────────
@@ -169,16 +170,25 @@ if mode == "ibiznes":
                         "Zgłoś to — dopasujemy nazwy tabel do Twojej bazy iBiznes."
                     )
 
-                # Pobierz dane (5 elementów: kartoteka, obroty, zamowienia-header,
-                # in_transit-per-SKU, tbl_info)
-                kartoteka_df, obroty_df, zamowienia_df, in_transit_df, _ = fetch_all(db_url_input, days=days)
+                # Pobierz dane (6 elementów: kartoteka, obroty, zamowienia-header,
+                # in_transit-per-SKU, open_orders_lines-per-(NrZam,SKU), tbl_info)
+                (
+                    kartoteka_df,
+                    obroty_df,
+                    zamowienia_df,
+                    in_transit_df,
+                    open_lines_df,
+                    _,
+                ) = fetch_all(db_url_input, days=days)
 
                 in_transit_count = len(in_transit_df) if in_transit_df is not None else 0
+                lines_count = len(open_lines_df) if open_lines_df is not None else 0
                 st.caption(
                     f"Pobrano: {len(kartoteka_df)} aktywnych produktów (kartoteka po filtrze Akt), "
                     f"{len(obroty_df)} ruchów magazynowych, "
-                    f"{len(zamowienia_df)} otwartych zamówień (header), "
-                    f"{in_transit_count} pozycji 'w drodze' (per SKU)"
+                    f"**{len(zamowienia_df)} otwartych zamówień do dostawców**, "
+                    f"{in_transit_count} pozycji 'w drodze' (per SKU), "
+                    f"{lines_count} line items w otwartych dokumentach"
                 )
 
                 # Konwertuj na format plikowy i przekaż do engine
@@ -201,6 +211,7 @@ if mode == "ibiznes":
                     zam_buf if zam_buf else None,
                     None,  # min_log_file
                     in_transit_df=in_transit_df,
+                    open_orders_lines_df=open_lines_df,
                 )
 
                 st.session_state.update({
@@ -342,10 +353,15 @@ with m1:
         delta_color="off",
     )
 with m2:
+    n_dostawcow = summary.get("dostawcow_z_otwartymi", 0)
+    delta_label = (
+        fmt_pln(summary.get("wartosc_w_drodze", 0))
+        + (f"  ({n_dostawcow} dostawców)" if n_dostawcow else "")
+    )
     st.metric(
         "🚚 W drodze",
         f"{summary.get('produktow_w_drodze', 0)} poz.",
-        fmt_pln(summary.get("wartosc_w_drodze", 0)),
+        delta_label,
         delta_color="off",
     )
 with m3:
@@ -379,7 +395,7 @@ with dl1:
     try:
         full_bytes = generate_full_excel(analiza, zam_df, summary)
         st.download_button(
-            label="📥 Pełna analiza (6 arkuszy)",
+            label="📥 Pełna analiza (Excel)",
             data=full_bytes,
             file_name=f"AddAll_analiza_{today}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -390,7 +406,7 @@ with dl1:
 
 with dl2:
     try:
-        order_bytes = generate_order_excel(analiza)
+        order_bytes = generate_order_excel(analiza, summary)
         st.download_button(
             label="📥 Lista zamówień (prosta)",
             data=order_bytes,
@@ -403,9 +419,10 @@ with dl2:
 
 with dl3:
     st.info(
-        "**Pełna analiza** — 6 arkuszy: ZAMÓW DZIŚ, Zamów tydzień, "
-        "W drodze, Top movers, Dead stock, Pełna analiza.\n\n"
-        "**Lista zamówień** — uproszczony plik do iBiznes lub dostawców."
+        "**Pełna analiza** — m.in. ZAMÓW DZIŚ, Zamów tydzień, "
+        "nagłówek zamówień (w drodze), **Otwarte u dostawcy**, Top movers, Dead stock.\n\n"
+        "**Lista zamówień** — uproszczony plik; kolumna „Otwarte u dostawcy” pokazuje dokumenty, "
+        "do których można dorzucić pozycje."
     )
 
 st.divider()
@@ -413,9 +430,10 @@ st.divider()
 # ── Tabele wyników ────────────────────────────────────────────────────────────
 st.subheader("4. Wyniki analizy")
 
-tab_dzis, tab_tydz, tab_droga, tab_top, tab_dead = st.tabs([
+tab_dzis, tab_tydz, tab_droga, tab_otwarte, tab_top, tab_dead = st.tabs([
     "🚨 Zamów DZIŚ", "🟡 Zamów w tygodniu",
-    "🔵 W drodze", "📈 Top movers", "⚫ Dead stock",
+    "🔵 Nagłówek zamówień", "🏭 Otwarte u dostawców",
+    "📈 Top movers", "⚫ Dead stock",
 ])
 
 nazwa_col = find_col(analiza, "nazwa towaru")
@@ -447,10 +465,42 @@ def show_table(df, cols, extra_rename=None):
     st.dataframe(df[avail].rename(columns=rename), use_container_width=True, hide_index=True)
 
 
+# Mapowanie dostawca → otwarte zamówienia (z summary)
+# Klucze są w UPPER, więc lookup robimy str(dostawca).strip().upper()
+supplier_open = summary.get("supplier_open_orders", {}) or {}
+
+
+def render_open_orders_banner(dostawca_name: str) -> None:
+    """Baner z numerami dokumentów — dopasowanie nazwy dostawcy jest rozmyte
+    (kartoteka vs iBiznes mogą się minimalnie różnić)."""
+    info = lookup_supplier_open_orders(supplier_open, dostawca_name)
+    if not info or not info.get("orders"):
+        return
+    liczba = info["liczba_dokumentow"]
+    wartosc = info["laczna_wartosc"]
+    data = info.get("najblizsza_data")
+    data_part = f" • najbliższa dostawa: **{data}**" if data else ""
+    nrs = ", ".join(o["nr"] for o in info["orders"][:5])
+    if liczba > 5:
+        nrs += f" (+{liczba - 5} więcej)"
+    st.info(
+        f"🚚 **U tego dostawcy masz już {liczba} otwartych zamówień** "
+        f"na łącznie **{fmt_pln(wartosc)}**{data_part}\n\n"
+        f"Dokumenty: `{nrs}`\n\n"
+        f"💡 Możesz **dorzucić nowe pozycje do istniejącego zamówienia** "
+        f"zamiast tworzyć nowy dokument."
+    )
+
+
 with tab_dzis:
     dzis = analiza[analiza["status"] == "ZAMÓW DZIŚ"].sort_values("dni_do_wyczerpania")
     if len(dzis) == 0:
         st.success("🎉 Brak produktów do pilnego zamówienia!")
+        if supplier_open:
+            st.info(
+                f"Nadal masz **{len(supplier_open)}** dostawców z **otwartymi dokumentami** "
+                f"(jak w iBiznes „W realizacji”) — zobacz zakładkę **🏭 Otwarte u dostawców**."
+            )
     else:
         st.error(
             f"**{len(dzis)} produktów wymaga zamówienia DZIŚ** "
@@ -465,10 +515,17 @@ with tab_dzis:
                     if min_v > 0 and razem < min_v
                     else ("✅ minimum OK" if min_v > 0 else "")
                 )
-                label = f"🏭 {dostawca} — {fmt_pln(razem)}"
+                # Dodaj badge "ma otwarte zamówienia"
+                supplier_info = lookup_supplier_open_orders(supplier_open, dostawca)
+                open_badge = (
+                    f"  |  🚚 {supplier_info['liczba_dokumentow']} otwart."
+                    if supplier_info else ""
+                )
+                label = f"🏭 {dostawca} — {fmt_pln(razem)}{open_badge}"
                 if status:
                     label += f"  |  {status}"
                 with st.expander(label, expanded=True):
+                    render_open_orders_banner(dostawca)
                     show_table(grupa, display_cols)
         else:
             show_table(dzis, display_cols)
@@ -484,10 +541,16 @@ with tab_tydz:
         )
         if dos_col:
             for dostawca, grupa in tydzien.groupby(dos_col):
+                supplier_info = lookup_supplier_open_orders(supplier_open, dostawca)
+                open_badge = (
+                    f"  |  🚚 {supplier_info['liczba_dokumentow']} otwart."
+                    if supplier_info else ""
+                )
                 with st.expander(
-                    f"🏭 {dostawca} — {fmt_pln(grupa['wartosc_zamowienia'].sum())}",
+                    f"🏭 {dostawca} — {fmt_pln(grupa['wartosc_zamowienia'].sum())}{open_badge}",
                     expanded=False,
                 ):
+                    render_open_orders_banner(dostawca)
                     show_table(grupa, display_cols)
         else:
             show_table(tydzien, display_cols)
@@ -503,6 +566,56 @@ with tab_droga:
     else:
         clean = zam_df.drop(columns=["_data_realiz"], errors="ignore")
         st.dataframe(clean, use_container_width=True, hide_index=True)
+
+with tab_otwarte:
+    st.markdown(
+        "**Otwarte zamówienia do dostawców** — zestawienie per firma: numery dokumentów (np. ZAZ/…), "
+        "wartości i **SKU już w drodze**. To odpowiada widokowi z iBiznes; tu dodatkowo widać, "
+        "do którego dokumentu można **dorzucić** kolejne pozycje."
+    )
+    if supplier_open:
+        rows = []
+        for _key, info in sorted(
+            supplier_open.items(),
+            key=lambda kv: (-(kv[1].get("laczna_wartosc") or 0), kv[1].get("nazwa", "")),
+        ):
+            naj = info.get("najblizsza_data") or ""
+            doc_list = info.get("orders") or []
+            n_docs = len(doc_list)
+            docs_short = ", ".join(o["nr"] for o in doc_list[:12])
+            if n_docs > 12:
+                docs_short += f" (+{n_docs - 12} więcej)"
+            kody = info.get("kody_w_drodze") or []
+            sku_n = len(kody) if isinstance(kody, list) else len(set(kody))
+            rows.append({
+                "Dostawca": info.get("nazwa", _key),
+                "Otwartych dokumentów": info.get("liczba_dokumentow", n_docs),
+                "Łączna wartość PLN": round(info.get("laczna_wartosc") or 0, 2),
+                "Najbliższa dostawa": naj,
+                "Numery dokumentów": docs_short,
+                "Unikalnych SKU w drodze": sku_n,
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.caption(
+            f"Łącznie **{len(supplier_open)}** dostawców z aktywnymi zamówieniami. "
+            "Szczegóły pozycji (SKU) są w eksporterze Excel → arkusz „🏭 Otwarte u dostawcy”."
+        )
+    elif zam_df is not None and len(zam_df) > 0:
+        st.warning(
+            "Rozszerzone zestawienie (łączenie z kartoteką) jest niedostępne — pokazuję surowy "
+            "eksport nagłówka zamówień. Uruchom ponownie analizę z iBiznes lub z pliku zamówień."
+        )
+        clean = zam_df.drop(columns=["_data_realiz"], errors="ignore")
+        st.dataframe(clean, use_container_width=True, hide_index=True)
+    else:
+        st.info(
+            "Brak danych o otwartych zamówieniach. "
+            + (
+                "Sprawdź połączenie z bazą i czy w iBiznes są dokumenty „w realizacji”."
+                if source == "ibiznes"
+                else "W trybie plików **wgraj** `ZamówieniaDlaDostawcy.csv` z eksportu iBiznes."
+            )
+        )
 
 with tab_top:
     top = analiza[analiza["srednie_dzienne"] > 0].nlargest(20, "srednie_dzienne")
@@ -790,7 +903,7 @@ else:
 # ── Stopka ────────────────────────────────────────────────────────────────────
 st.divider()
 st.caption(
-    f"Add All Asystent Zakupowy v2.0 (Agent AI) | "
+    f"Add All Asystent Zakupowy v2.1 (otwarte zamówienia per dostawca) | "
     f"Dane analizy nie są zapisywane, pamięć agenta = `data/anita_memory.json` "
     f"(dla persystencji między deployami dodaj Railway Volume na `/app/data`) | "
     f"{datetime.now().strftime('%Y')}"
