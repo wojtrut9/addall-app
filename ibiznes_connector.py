@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import re
+import ssl
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, unquote
 
@@ -179,10 +180,65 @@ def _parse_url(url: str) -> dict:
     }
 
 
+def _relaxed_ssl_context() -> ssl.SSLContext:
+    """Kontekst TLS akceptujący STARE serwery MySQL.
+
+    Serwer iBiznes (db.firmatec.pl) oferuje starszy TLS/słabsze szyfry, które
+    nowy OpenSSL 3 (np. na Railway) domyślnie odrzuca → "SSLV3_ALERT_HANDSHAKE_
+    FAILURE". Rozluźniamy: bez weryfikacji certyfikatu, minimalna wersja TLSv1,
+    obniżony poziom bezpieczeństwa szyfrów. To łączność wewnętrzna do ERP —
+    priorytetem jest działające połączenie, nie walidacja cert.
+    """
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        ctx.minimum_version = ssl.TLSVersion.TLSv1
+    except (ValueError, AttributeError):
+        pass
+    try:
+        # SECLEVEL=0 dopuszcza stare szyfry/krótkie klucze (OpenSSL 3 blokuje je
+        # przy domyślnym SECLEVEL=2).
+        ctx.set_ciphers("DEFAULT@SECLEVEL=0")
+    except ssl.SSLError:
+        pass
+    return ctx
+
+
+def _is_ssl_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(k in msg for k in ("ssl", "handshake", "secure transport", "wrong version"))
+
+
 def get_connection(db_url: str) -> pymysql.Connection:
-    """Otwiera połączenie z MySQL iBiznes."""
+    """Otwiera połączenie z MySQL iBiznes, odporne na problemy TLS.
+
+    Tryb sterowany zmienną IBIZNES_DB_SSL:
+      - "disable"/"off"  → wymuś brak SSL
+      - "relaxed"/"on"   → wymuś rozluźniony TLS (dla starych serwerów)
+      - (brak/"auto")    → najpierw zwykłe połączenie; jeśli padnie na błędzie
+                           SSL — ponów z rozluźnionym TLS (działa lokalnie
+                           i na Railway/OpenSSL 3).
+    """
     params = _parse_url(db_url)
-    return pymysql.connect(**params)
+    mode = (os.environ.get("IBIZNES_DB_SSL") or "auto").strip().lower()
+
+    if mode in ("disable", "off", "none", "no", "false", "0"):
+        params.pop("ssl", None)
+        return pymysql.connect(**params)
+
+    if mode in ("relaxed", "require", "on", "ssl", "true", "1"):
+        params["ssl"] = _relaxed_ssl_context()
+        return pymysql.connect(**params)
+
+    # auto
+    try:
+        return pymysql.connect(**params)
+    except Exception as exc:
+        if _is_ssl_error(exc):
+            params["ssl"] = _relaxed_ssl_context()
+            return pymysql.connect(**params)
+        raise
 
 
 def test_connection(db_url: str) -> tuple[bool, str]:
