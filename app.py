@@ -152,8 +152,13 @@ if mode == "ibiznes":
                                     out[label] = ("(brak tabeli)", [], [])
                                     continue
                                 cols = get_columns(conn, tbl)
-                                # Spróbuj rozkład wartości Etap (jeśli kolumna istnieje)
+                                # Rozkład statusu realizacji. W iBiznes status zamówienia
+                                # zakupu siedzi w kolumnie `Typ` (0/1=otwarte, 2=zrealizowane,
+                                # 3=anulowane), a NIE w pustej kolumnie `etap`.
                                 etap_col = next(
+                                    (c for c in cols if c.lower() == "typ"),
+                                    None,
+                                ) or next(
                                     (c for c in cols if c.lower() in ("etap","status","stan","realizacja")),
                                     None,
                                 )
@@ -182,7 +187,12 @@ if mode == "ibiznes":
                         if len(data) > 1 and data[1]:
                             st.code("Kolumny:\n  " + "\n  ".join(data[1]), language="text")
                         if len(data) > 2 and data[2]:
-                            st.markdown("**Rozkład wartości Etap/Status:**")
+                            st.markdown(
+                                "**Rozkład statusu realizacji (`Typ`):** "
+                                "`0`/`1` = otwarte (w realizacji), `2` = zrealizowane, "
+                                "`3` = anulowane. Jeśli liczby nie zgadzają się z iBiznes "
+                                "→ ustaw `IBIZNES_OPEN_ORDER_TYPES` w Railway."
+                            )
                             for row in data[2]:
                                 vals = list(row.values()) if isinstance(row, dict) else list(row)
                                 st.write(f"  • `{vals[0]!r}` → {vals[1]} dokumentów")
@@ -586,7 +596,7 @@ dos_col   = find_col(analiza, "dostawca")
 display_cols = [c for c in [
     kod_col, nazwa_col, dos_col,
     "Stan", "w_drodze", "Stan Min.", "srednie_dzienne",
-    "dni_do_wyczerpania", "ile_zamowic", "wartosc_zamowienia",
+    "dni_do_wyczerpania", "ile_zamowic", "wartosc_zamowienia", "powod",
 ] if c and c in analiza.columns]
 
 col_labels = {
@@ -599,6 +609,7 @@ col_labels = {
     "w_drodze":           "W drodze (szt)",
     "efektywny_stan":     "Stan + w drodze",
     "marza_pct":          "Marża %",
+    "powod":              "Dlaczego",
 }
 
 
@@ -942,10 +953,12 @@ else:
     st.markdown("**🎯 Szybkie pytania:**")
     qcols = st.columns(4)
     quick_qs = [
-        "Co zamówić pilnie dziś? Podaj sumę per dostawca.",
+        "☀️ Odprawa poranna: co zamówić DZIŚ i DLACZEGO? Pogrupuj per dostawca, "
+        "przy każdej pozycji podaj ile szt, za ile PLN i powód (zapas/tempo). "
+        "Jeśli u dostawcy mam już otwarte zamówienie — powiedz że mogę dorzucić.",
         "Pokaż top 5 dostawców wg wartości zamówień.",
         "Produkty z marżą poniżej 20% — top 10 wg sprzedaży.",
-        "Jakie pozycje są w drodze i jaka łączna kwota?",
+        "Co jest już zamówione i w drodze? Podaj per dostawca i łączną kwotę.",
     ]
     for i, (qcol, q) in enumerate(zip(qcols, quick_qs)):
         with qcol:
@@ -1046,7 +1059,7 @@ else:
 # ── Stopka ────────────────────────────────────────────────────────────────────
 st.divider()
 st.caption(
-    f"Add All Asystent Zakupowy v2.1 (otwarte zamówienia per dostawca) | "
+    f"Add All Asystent Zakupowy v2.2 (poprawne mapowanie iBiznes + status zamówień po Typ) | "
     f"Dane analizy nie są zapisywane, pamięć agenta = `data/anita_memory.json` "
     f"(dla persystencji między deployami dodaj Railway Volume na `/app/data`) | "
     f"{datetime.now().strftime('%Y')}"

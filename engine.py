@@ -290,22 +290,22 @@ def analyze(
     ).round(2)
 
     # Rekomendowana ilość zamówienia: prognoza 21d + safety 7d - efektywny stan
-    # (efektywny = Stan + w_drodze, więc nie zamawiamy podwójnie tego co jedzie)
+    # (efektywny = Stan + w_drodze, więc nie zamawiamy podwójnie tego co jedzie).
+    # Dodatkowo podłoga = Stan Min. (smin z iBiznes) — jeśli ustawiony, cel zapasu
+    # nie schodzi poniżej minimum logistycznego towaru.
+    stan_min = analiza["Stan Min."] if "Stan Min." in analiza.columns else 0
     analiza["prognoza_30d"] = (analiza["srednie_dzienne"] * 21).round(0)
     analiza["safety_7d"] = (analiza["srednie_dzienne"] * 7).round(0)
+    cel_zapasu = np.maximum(analiza["prognoza_30d"] + analiza["safety_7d"], stan_min)
     analiza["ile_zamowic"] = np.where(
         analiza["srednie_dzienne"] > 0,
-        np.maximum(
-            0,
-            analiza["prognoza_30d"] + analiza["safety_7d"] - analiza["efektywny_stan"],
-        ).round(0),
+        np.maximum(0, cel_zapasu - analiza["efektywny_stan"]).round(0),
         0,
     )
-    # Limit: max 45 dni zużycia (sensowny zapas dla dystrybutora)
-    analiza["ile_zamowic"] = np.minimum(
-        analiza["ile_zamowic"],
-        (analiza["srednie_dzienne"] * 45).round(0),
-    ).astype(int)
+    # Limit: max 45 dni zużycia (sensowny zapas dla dystrybutora), ale nie niżej
+    # niż minimum logistyczne towaru.
+    cap = np.maximum((analiza["srednie_dzienne"] * 45).round(0), stan_min)
+    analiza["ile_zamowic"] = np.minimum(analiza["ile_zamowic"], cap).astype(int)
 
     analiza["wartosc_zamowienia"] = (
         analiza["ile_zamowic"] * analiza["Cena zakupu netto"]
@@ -336,6 +336,36 @@ def analyze(
         return "OK"
 
     analiza["status"] = analiza.apply(get_status, axis=1)
+
+    # ── 7a. Powód rekomendacji (czytelne "dlaczego") ─────────────────────────
+    # Składa krótkie, ludzkie uzasadnienie z policzonych metryk — używane w
+    # tabelach UI, eksporcie Excel i przez agenta AI (query_products) żeby
+    # mówić Anicie nie tylko CO, ale DLACZEGO zamówić.
+    def get_powod(row):
+        z = row["srednie_dzienne"]
+        d = row["dni_do_wyczerpania"]
+        wd = row.get("w_drodze", 0)
+        st = row.get("status", "")
+        smin = row.get("Stan Min.", 0) or 0
+        stan = row.get("Stan", 0) or 0
+        parts = []
+        if st == "DEAD STOCK":
+            return "Brak sprzedaży w okresie — zamrożony kapitał, nie zamawiać."
+        if st == "NIEAKTYWNY":
+            return "Brak stanu i brak sprzedaży."
+        if z > 0:
+            parts.append(f"schodzi {z:.2f} szt/dzień")
+            if d < 9999:
+                parts.append(f"zapasu na ~{d:.0f} dni")
+        if wd > 0:
+            parts.append(f"w drodze już {wd:.0f} szt")
+        if smin > 0 and stan < smin:
+            parts.append(f"stan {stan:.0f} poniżej minimum {smin:.0f}")
+        if st == "JEDNORAZÓWKA":
+            parts.append("mało transakcji — sprawdź czy to nie jednorazówka")
+        return "; ".join(parts) if parts else "Zapas wystarczający."
+
+    analiza["powod"] = analiza.apply(get_powod, axis=1)
 
     # ── 8. Minima logistyczne dostawców (opcjonalny plik) ────────────────────
     min_log = {}

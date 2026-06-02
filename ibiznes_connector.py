@@ -9,6 +9,7 @@ Zmienna środowiskowa: IBIZNES_DB_URL = "mysql://user:pass@host:port/dbname"
 """
 from __future__ import annotations
 
+import os
 import re
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, unquote
@@ -16,6 +17,78 @@ from urllib.parse import urlparse, unquote
 import pandas as pd
 import pymysql
 import pymysql.cursors
+
+
+# ── Jawne mapowanie kolumn iBiznes (firmatec) ─────────────────────────────────
+#
+# Schemat iBiznes jest stały (tabele addallspkazogr* / firma* mają identyczne
+# kolumny), więc zamiast ZGADYWAĆ nazwy heurystyką (co dawało błędne wyniki —
+# patrz historia: cena zakupu mapowała się na cenę brutto sprzedaży, dostawca na
+# pustą kolumnę, status na zawsze-puste `etap`) trzymamy je tu jawnie.
+# Heurystyka (_pick_col) zostaje jako fallback dla innych ERP-ów / nietypowych baz.
+IBIZNES_COLS = {
+    "towary": {  # kartoteka towarów
+        "kod": "Kod", "nazwa": "Nazw", "grupa": "Gr", "stan": "STAN",
+        "cena_zak": "Cz", "cena_sp": "CN1", "stan_min": "smin",
+        "dostawca": "Alias", "jm": "JM", "akt": "Akt", "anul": "Anul",
+    },
+    "spec": {  # ruchy magazynowe (WZ/PZ/ZAK…)
+        "typ": "Typ", "data": "Data", "kod": "Kod", "nazwa": "Nazw",
+        "klient": "Alias", "il": "il", "cena_zak": "CB", "cena_sp": "CN",
+    },
+    "zamz": {  # nagłówek zamówień ZAKUPU (do dostawców)
+        "id": "ID", "nr": "NrR", "dostawca": "Nazw", "alias": "Alias",
+        "wartosc": "Wart", "status": "Typ", "data_utw": "Dwy", "anul": "Anul",
+    },
+    "zamzy": {  # pozycje zamówień zakupu
+        "id": "ID", "parent": "IDf", "kod": "Kod", "nazwa": "Nazw",
+        "il": "il", "cena": "CN",
+    },
+}
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return str(val).strip().lower() in ("1", "true", "tak", "yes", "y", "on")
+
+
+def _env_csv(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    val = os.environ.get(name)
+    if not val:
+        return tuple(default)
+    return tuple(p.strip() for p in str(val).split(",") if p.strip())
+
+
+def _open_order_types() -> tuple[str, ...]:
+    """Wartości `zamz.Typ` oznaczające OTWARTE zamówienie (w realizacji / w drodze).
+
+    iBiznes koduje etap realizacji zamówienia zakupu w kolumnie `Typ`:
+      0 = nowe / niezatwierdzone (świeżo utworzone)   ┐ OTWARTE (jeszcze nie dotarło)
+      1 = w realizacji / częściowo zrealizowane        ┘
+      2 = zrealizowane (towar przyjęty)  ← zamknięte
+      3 = anulowane                       ← zamknięte
+    Konfigurowalne przez Railway → Variables: IBIZNES_OPEN_ORDER_TYPES="0,1".
+    """
+    return _env_csv("IBIZNES_OPEN_ORDER_TYPES", ("0", "1"))
+
+
+def _col_present(cols: list[str], name: str | None) -> str | None:
+    """Zwraca rzeczywistą nazwę kolumny (z oryginalną wielkością liter) jeśli
+    `name` istnieje w tabeli (porównanie case-insensitive), inaczej None."""
+    if not name:
+        return None
+    low = name.lower()
+    for c in cols:
+        if c.lower() == low:
+            return c
+    return None
+
+
+def _map_col(cols: list[str], ibiznes_name: str | None, *hints: str) -> str | None:
+    """Najpierw jawna kolumna iBiznes, potem heurystyka _pick_col (fallback)."""
+    return _col_present(cols, ibiznes_name) or _pick_col(cols, *hints)
 
 
 # ── Połączenie ────────────────────────────────────────────────────────────────
@@ -204,9 +277,16 @@ def identify_tables(conn: pymysql.Connection) -> dict[str, str | None]:
     """
     tables = discover_tables(conn)
 
-    # Rozdziel tabele na prefix "addall*" (sp. z o.o.) i "firma*" (JDG)
+    # Rozdziel tabele na prefix "addall*" (sp. z o.o.) i "firma*" (JDG).
+    # Domyślnie analizujemy TYLKO sp. z o.o. — to realny kupujący (1002 zam.
+    # zakupu vs 1 w JDG). Scalanie kartotek dwóch firm po `Kod` mieszałoby stany,
+    # więc JDG włączamy tylko jawnie przez IBIZNES_INCLUDE_FIRMA=true.
     spzoo = [t for t in tables if t.lower().startswith("addall")]
-    firma = [t for t in tables if t.lower().startswith("firma")]
+    firma = (
+        [t for t in tables if t.lower().startswith("firma")]
+        if _env_flag("IBIZNES_INCLUDE_FIRMA", False)
+        else []
+    )
 
     return {
         # Ruchy magazynowe (WZ/PZ) — znane z CRM
@@ -289,10 +369,11 @@ def fetch_obroty(
             continue
 
         cols = get_columns(conn, tbl)
-        kod_col   = _pick_col(cols, *_KOD_HINTS) or "Symbol"
-        nazwa_col = _pick_col(cols, *_NAZWA_HINTS) or "Nazwa"
+        S = IBIZNES_COLS["spec"]
+        kod_col   = _map_col(cols, S["kod"], *_KOD_HINTS) or "Symbol"
+        nazwa_col = _map_col(cols, S["nazwa"], *_NAZWA_HINTS) or "Nazw"
         jm_col    = _pick_col(cols, *_JM_HINTS)
-        cs_col    = _pick_col(cols, *_CENA_S_HINTS)  # cena sprzedaży
+        cs_col    = _map_col(cols, S["cena_sp"], *_CENA_S_HINTS)  # cena sprzedaży (CN)
 
         # Kolumny obowiązkowe
         required = ["NrR", "Alias", "Data", "Typ", "Il", "Cb"]
@@ -453,17 +534,19 @@ def fetch_kartoteka(
             continue
 
         cols = get_columns(conn, tbl)
+        M = IBIZNES_COLS["towary"]
 
-        kod_col    = _pick_col(cols, *_KOD_HINTS)
-        nazwa_col  = _pick_col(cols, *_NAZWA_HINTS)
-        stan_col   = _pick_col(cols, *_STAN_HINTS)
-        cenaz_col  = _pick_col(cols, *_CENA_Z_HINTS)
-        cenas_col  = _pick_col(cols, *_CENA_S_HINTS)
-        stanmin_col = _pick_col(cols, *_STAN_MIN_HINTS)
-        dos_col    = _pick_col(cols, *_DOSTAWCA_HINTS)
-        grupa_col  = _pick_col(cols, *_GRUPA_HINTS)
-        jm_col     = _pick_col(cols, *_JM_HINTS)
-        akt_col    = _pick_col(cols, *_AKT_HINTS) if only_active else None
+        kod_col    = _map_col(cols, M["kod"], *_KOD_HINTS)
+        nazwa_col  = _map_col(cols, M["nazwa"], *_NAZWA_HINTS)
+        stan_col   = _map_col(cols, M["stan"], *_STAN_HINTS)
+        cenaz_col  = _map_col(cols, M["cena_zak"], *_CENA_Z_HINTS)
+        cenas_col  = _map_col(cols, M["cena_sp"], *_CENA_S_HINTS)
+        stanmin_col = _map_col(cols, M["stan_min"], *_STAN_MIN_HINTS)
+        dos_col    = _map_col(cols, M["dostawca"], *_DOSTAWCA_HINTS)
+        grupa_col  = _map_col(cols, M["grupa"], *_GRUPA_HINTS)
+        jm_col     = _map_col(cols, M["jm"], *_JM_HINTS)
+        akt_col    = _map_col(cols, M["akt"], *_AKT_HINTS) if only_active else None
+        anul_col   = _col_present(cols, M["anul"])
 
         if not kod_col or not nazwa_col:
             continue
@@ -480,19 +563,27 @@ def fetch_kartoteka(
         else:           select_parts.append("0 AS `Cena zakupu netto`")
         if cenas_col:  select_parts.append(f"`{cenas_col}` AS `Cena Podstawowa netto`")
         else:           select_parts.append("0 AS `Cena Podstawowa netto`")
-        if stanmin_col: select_parts.append(f"`{stanmin_col}` AS `Stan Min.`")
+        # smin: w iBiznes wartość -1 oznacza "nie ustawiono minimum" → traktuj jako 0
+        if stanmin_col: select_parts.append(f"GREATEST(0, COALESCE(`{stanmin_col}`, 0)) AS `Stan Min.`")
         else:            select_parts.append("0 AS `Stan Min.`")
         if dos_col:    select_parts.append(f"`{dos_col}` AS `Dostawca`")
         else:           select_parts.append("'' AS `Dostawca`")
         if jm_col:     select_parts.append(f"`{jm_col}` AS `JM`")
 
-        # Filtr aktywności — tylko produkty z Akt='T'/'1'/NULL (NULL traktujemy jako aktywne)
-        where_clause = ""
+        # Filtr aktywności — tylko produkty z Akt='T'/'1'/NULL (NULL traktujemy jako
+        # aktywne) i NIE anulowane (Anul != 'T'/'Y').
+        conds = []
         if akt_col:
-            where_clause = (
-                f" WHERE (`{akt_col}` IS NULL "
+            conds.append(
+                f"(`{akt_col}` IS NULL "
                 f"OR UPPER(TRIM(CAST(`{akt_col}` AS CHAR))) IN ('T','TAK','Y','YES','1','A'))"
             )
+        if anul_col:
+            conds.append(
+                f"(`{anul_col}` IS NULL "
+                f"OR UPPER(TRIM(CAST(`{anul_col}` AS CHAR))) NOT IN ('T','TAK','Y','YES','1'))"
+            )
+        where_clause = (" WHERE " + " AND ".join(conds)) if conds else ""
 
         sql = f"SELECT {', '.join(select_parts)} FROM `{tbl}`{where_clause}"
 
@@ -557,13 +648,39 @@ _ETAP_ZAMKNIETE = ("Z", "A", "X", "K", "9", "z", "a", "x", "k")
 
 
 def _build_open_orders_where(etap_col: str) -> str:
-    """Zwraca WHERE wybierający otwarte (niezrealizowane) zamówienia."""
+    """LEGACY (nieużywane): filtr otwartych po kolumnie `etap`.
+
+    W bazie iBiznes Add All `etap` jest ZAWSZE puste, więc ten filtr przepuszczał
+    wszystkie 1002 zamówienia jako "otwarte". Zostaje tylko dla zgodności wstecznej
+    / innych baz. Aktualnie używamy `_build_open_orders_where_typ` (kolumna `Typ`).
+    """
     placeholders = ", ".join(f"'{e}'" for e in _ETAP_ZAMKNIETE)
     return (
         f" WHERE (`{etap_col}` IS NULL "
         f"OR TRIM(CAST(`{etap_col}` AS CHAR)) = '' "
         f"OR UPPER(TRIM(CAST(`{etap_col}` AS CHAR))) NOT IN ({placeholders.upper()}))"
     )
+
+
+def _build_open_orders_where_typ(
+    status_col: str,
+    anul_col: str | None = None,
+    alias: str = "",
+) -> str:
+    """WHERE wybierający OTWARTE zamówienia zakupu po kolumnie `Typ` (etap realizacji).
+
+    Otwarte = `Typ` ∈ IBIZNES_OPEN_ORDER_TYPES (domyślnie 0,1) i niezanulowane.
+    `alias` to prefiks tabeli w JOIN-ie (np. 'h.') — pusty dla prostego SELECT-a.
+    """
+    types = _open_order_types()
+    placeholders = ", ".join(f"'{t.upper()}'" for t in types)
+    parts = [f"UPPER(TRIM(CAST({alias}`{status_col}` AS CHAR))) IN ({placeholders})"]
+    if anul_col:
+        parts.append(
+            f"({alias}`{anul_col}` IS NULL "
+            f"OR UPPER(TRIM(CAST({alias}`{anul_col}` AS CHAR))) NOT IN ('T','TAK','Y','YES','1'))"
+        )
+    return " WHERE " + " AND ".join(parts)
 
 
 def fetch_zamowienia(
@@ -590,13 +707,19 @@ def fetch_zamowienia(
             continue
 
         cols = get_columns(conn, tbl)
+        Z = IBIZNES_COLS["zamz"]
 
-        nr_col    = _pick_col(cols, "NrZ", "Nr", "Numer", "NrZam", "NrDoc")
-        dos_col   = _pick_col(cols, "Dostawca", "Alias", "Kontrahent", "Supplier")
-        war_col   = _pick_col(cols, "Wartosc", "Wartość", "Kwota", "Suma", "Brutto", "Netto")
+        nr_col    = _map_col(cols, Z["nr"], "NrR", "NrZ", "Numer", "NrZam", "NrDoc")
+        # Dostawca = `Alias` (krótka nazwa, SPÓJNA z kartoteką, gdzie dostawca też
+        # siedzi w `Alias`) — dzięki temu rekomendacje da się podpiąć do otwartych
+        # zamówień. Pełną nazwę `Nazw` zostawiamy tylko jako fallback.
+        dos_col   = _map_col(cols, Z["alias"], "Alias", "Dostawca", "Kontrahent", "Supplier") \
+                    or _col_present(cols, Z["dostawca"])
+        war_col   = _map_col(cols, Z["wartosc"], "Wartosc", "Wartość", "Kwota", "Suma", "Brutto", "Netto")
+        data_utw_col   = _map_col(cols, Z["data_utw"], "DataUtw", "DataWyst", "DataDok", "Data")
         data_real_col  = _pick_col(cols, "DataReal", "DataRealizacji", "DataDost", "DataZam")
-        data_utw_col   = _pick_col(cols, "DataUtw", "DataWyst", "DataDok", "Data")
-        etap_col  = _pick_col(cols, "Etap", "Status", "Stan", "Realizacja")
+        status_col = _map_col(cols, Z["status"], "Etap", "Status", "Stan", "Realizacja")
+        anul_col   = _col_present(cols, Z["anul"])
 
         if not nr_col:
             continue
@@ -610,10 +733,14 @@ def fetch_zamowienia(
         else:               select_parts.append("'' AS `Data realiz.`")
         if data_utw_col:   select_parts.append(f"`{data_utw_col}` AS `Data utworzenia`")
         else:               select_parts.append("'' AS `Data utworzenia`")
-        if etap_col:       select_parts.append(f"`{etap_col}` AS `etap`")
-        else:               select_parts.append("'N' AS `etap`")
+        if status_col:     select_parts.append(f"`{status_col}` AS `etap`")
+        else:               select_parts.append("'0' AS `etap`")
 
-        where_clause = _build_open_orders_where(etap_col) if etap_col else ""
+        # Otwarte = Typ ∈ {0,1} i niezanulowane (NIE po pustej kolumnie `etap`!)
+        where_clause = (
+            _build_open_orders_where_typ(status_col, anul_col)
+            if status_col else ""
+        )
 
         sql = f"SELECT {', '.join(select_parts)} FROM `{tbl}`{where_clause}"
 
@@ -679,10 +806,12 @@ def fetch_in_transit_lines(
         except Exception:
             continue
 
-        kod_col = _pick_col(spec_cols, *_KOD_HINTS)
-        il_col  = _pick_col(spec_cols, "Il", "Ilosc", "Qty", "Quantity")
-        cena_col = _pick_col(spec_cols, *_CENA_Z_HINTS) or _pick_col(spec_cols, "Cena", "Cb")
-        nrz_col = _pick_col(spec_cols, "NrZ", "Nr", "Numer", "NrZam", "NrDoc", "NrR")
+        ZY = IBIZNES_COLS["zamzy"]
+        kod_col = _map_col(spec_cols, ZY["kod"], *_KOD_HINTS)
+        il_col  = _map_col(spec_cols, ZY["il"], "Il", "Ilosc", "Qty", "Quantity")
+        cena_col = _map_col(spec_cols, ZY["cena"], *_CENA_Z_HINTS) or _pick_col(spec_cols, "Cena", "Cb")
+        # Klucz do nagłówka: zamzy.IDf = zamz.ID (NIE NrR=Nr — to string vs int!)
+        nrz_col = _map_col(spec_cols, ZY["parent"], "IDf", "NrR", "NrZ", "Nr")
 
         if not kod_col or not il_col:
             continue
@@ -700,7 +829,7 @@ def fetch_in_transit_lines(
         else:
             select_parts.append("0 AS `wartosc_w_drodze`")
 
-        # JOIN z tabelą header by odfiltrować zrealizowane zamówienia
+        # JOIN z nagłówkiem (zamz) po IDf=ID, by zostawić tylko OTWARTE zamówienia
         join_clause = ""
         where_clause = ""
         if head_tbl and nrz_col:
@@ -708,21 +837,15 @@ def fetch_in_transit_lines(
                 head_cols = get_columns(conn, head_tbl)
             except Exception:
                 head_cols = []
-            head_nrz = _pick_col(head_cols, "NrZ", "Nr", "Numer", "NrZam", "NrDoc", "NrR")
-            etap_col = _pick_col(head_cols, "Etap", "Status", "Stan", "Realizacja")
-            if head_nrz and etap_col:
+            head_id = _map_col(head_cols, IBIZNES_COLS["zamz"]["id"], "ID", "NrR", "Nr")
+            status_col = _map_col(head_cols, IBIZNES_COLS["zamz"]["status"], "Etap", "Status", "Stan", "Realizacja")
+            anul_col = _col_present(head_cols, IBIZNES_COLS["zamz"]["anul"])
+            if head_id and status_col:
                 join_clause = (
-                    f" JOIN `{head_tbl}` h ON s.`{nrz_col}` = h.`{head_nrz}`"
+                    f" JOIN `{head_tbl}` h ON s.`{nrz_col}` = h.`{head_id}`"
                 )
-                # Otwarte = wszystko poza zrealizowane/anulowane.
-                # Filtrujemy negatywnie (NOT IN ('Z','A','X','K')) żeby nie
-                # przegapić częściowo zrealizowanych ('C') ani potwierdzonych ('P').
-                placeholders = ", ".join(f"'{e.upper()}'" for e in _ETAP_ZAMKNIETE)
-                where_clause = (
-                    f" WHERE (h.`{etap_col}` IS NULL "
-                    f"OR TRIM(CAST(h.`{etap_col}` AS CHAR)) = '' "
-                    f"OR UPPER(TRIM(CAST(h.`{etap_col}` AS CHAR))) NOT IN ({placeholders}))"
-                )
+                # Otwarte = Typ ∈ {0,1} i niezanulowane.
+                where_clause = _build_open_orders_where_typ(status_col, anul_col, alias="h.")
 
         sql = (
             f"SELECT {select_parts[0]}, {select_parts[1]}"
@@ -793,25 +916,29 @@ def fetch_open_orders_with_lines(
         except Exception:
             continue
 
-        kod_col   = _pick_col(spec_cols, *_KOD_HINTS)
-        nazwa_col = _pick_col(spec_cols, *_NAZWA_HINTS)
-        il_col    = _pick_col(spec_cols, "Il", "Ilosc", "Qty", "Quantity")
-        cena_col  = _pick_col(spec_cols, *_CENA_Z_HINTS) or _pick_col(spec_cols, "Cena", "Cb")
-        nrz_spec  = _pick_col(spec_cols, "NrZ", "Nr", "Numer", "NrZam", "NrDoc", "NrR")
+        ZY = IBIZNES_COLS["zamzy"]
+        Z = IBIZNES_COLS["zamz"]
+        kod_col   = _map_col(spec_cols, ZY["kod"], *_KOD_HINTS)
+        nazwa_col = _map_col(spec_cols, ZY["nazwa"], *_NAZWA_HINTS)
+        il_col    = _map_col(spec_cols, ZY["il"], "Il", "Ilosc", "Qty", "Quantity")
+        cena_col  = _map_col(spec_cols, ZY["cena"], *_CENA_Z_HINTS) or _pick_col(spec_cols, "Cena", "Cb")
+        nrz_spec  = _map_col(spec_cols, ZY["parent"], "IDf", "NrR", "Nr")  # klucz do nagłówka
 
-        nrz_head  = _pick_col(head_cols, "NrZ", "Nr", "Numer", "NrZam", "NrDoc", "NrR")
-        dos_head  = _pick_col(head_cols, "Dostawca", "Alias", "Kontrahent", "Supplier")
-        data_head = _pick_col(head_cols, "DataReal", "DataRealizacji", "DataDost", "DataZam")
-        etap_head = _pick_col(head_cols, "Etap", "Status", "Stan", "Realizacja")
+        head_id   = _map_col(head_cols, Z["id"], "ID", "NrR", "Nr")          # ID nagłówka
+        nr_disp   = _map_col(head_cols, Z["nr"], "NrR", "Nr", "Numer")        # ładny numer (ZAZ/…)
+        dos_head  = _map_col(head_cols, Z["alias"], "Alias", "Dostawca", "Kontrahent", "Supplier")
+        data_head = _map_col(head_cols, Z["data_utw"], "DataUtw", "DataWyst", "Data")
+        status_head = _map_col(head_cols, Z["status"], "Etap", "Status", "Stan", "Realizacja")
+        anul_head = _col_present(head_cols, Z["anul"])
 
-        if not kod_col or not il_col or not nrz_spec or not nrz_head:
+        if not kod_col or not il_col or not nrz_spec or not head_id:
             continue
 
         select_parts = [
             f"s.`{kod_col}` AS `Kod towaru`",
             (f"s.`{nazwa_col}` AS `Nazwa`" if nazwa_col else "'' AS `Nazwa`"),
             (f"h.`{dos_head}` AS `Dostawca`" if dos_head else "'' AS `Dostawca`"),
-            f"h.`{nrz_head}` AS `Nr Zamówienia`",
+            (f"h.`{nr_disp}` AS `Nr Zamówienia`" if nr_disp else f"h.`{head_id}` AS `Nr Zamówienia`"),
             (f"h.`{data_head}` AS `Data realiz.`" if data_head else "'' AS `Data realiz.`"),
             f"CAST(REPLACE(REPLACE(CAST(s.`{il_col}` AS CHAR), ',', '.'), ' ', '') AS DECIMAL(18,3)) AS `ilosc`",
             (
@@ -821,19 +948,16 @@ def fetch_open_orders_with_lines(
             ),
         ]
 
-        where_clause = ""
-        if etap_head:
-            placeholders = ", ".join(f"'{e.upper()}'" for e in _ETAP_ZAMKNIETE)
-            where_clause = (
-                f" WHERE (h.`{etap_head}` IS NULL "
-                f"OR TRIM(CAST(h.`{etap_head}` AS CHAR)) = '' "
-                f"OR UPPER(TRIM(CAST(h.`{etap_head}` AS CHAR))) NOT IN ({placeholders}))"
-            )
+        # Otwarte = Typ ∈ {0,1} i niezanulowane (nagłówek aliasowany jako h.)
+        where_clause = (
+            _build_open_orders_where_typ(status_head, anul_head, alias="h.")
+            if status_head else ""
+        )
 
         sql = (
             f"SELECT {', '.join(select_parts)} "
             f"FROM `{spec_tbl}` s "
-            f"JOIN `{head_tbl}` h ON s.`{nrz_spec}` = h.`{nrz_head}`"
+            f"JOIN `{head_tbl}` h ON s.`{nrz_spec}` = h.`{head_id}`"
             f"{where_clause}"
         )
 

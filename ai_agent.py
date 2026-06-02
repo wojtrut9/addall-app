@@ -191,7 +191,10 @@ def query_products(
             "wartosc_zamowienia": round(float(r.get("wartosc_zamowienia", 0) or 0), 0),
             "wartosc_stanu": round(float(r.get("wartosc_stanu", 0) or 0), 0),
             "marza_pct": round(float(r.get("marza_pct", 0) or 0), 1),
+            "stan_min": float(r.get("Stan Min.", 0) or 0),
             "status": str(r.get("status", "")),
+            # Gotowe uzasadnienie "dlaczego" — cytuj je Anitcie zamiast wymyślać własne
+            "powod": str(r.get("powod", "")),
         })
 
     suma_zamowienia = round(sum(r["wartosc_zamowienia"] for r in rows), 0)
@@ -601,6 +604,16 @@ ZASADY ODPOWIEDZI — to są ZAŁOŻENIA KRYTYCZNE NIE PRZEKRACZALNE:
   TO POZWALA ANITCIE NIE DUBLOWAĆ WYSIŁKU.
 - Sortuj rekomendacje wg priorytetu: ZAMÓW DZIŚ → ZAMÓW TYDZIEŃ → reszta.
 - Przy każdej pozycji ZAWSZE wspomnij ile jest "w drodze" jeśli > 0.
+
+⚠️ ZAWSZE PODAJ "DLACZEGO" przy każdej rekomendacji:
+- Każda pozycja "do zamówienia" MUSI mieć krótkie uzasadnienie. Narzędzie
+  query_products zwraca gotowe pole `powod` (np. "schodzi 3,0 szt/dzień; zapasu
+  na ~2 dni; stan 5 poniżej minimum 25") — CYTUJ JE, nie wymyślaj własnych liczb.
+- Dobra rekomendacja brzmi: "**HIGA** — Ręcznik ZZ (zamów 80 szt, 1 104 PLN):
+  schodzi 3 szt/dz, zapasu na 2 dni, poniżej minimum." Anita ma od razu wiedzieć
+  ILE, ZA ILE i DLACZEGO.
+- Jeśli coś już jedzie (`w_drodze` > 0) — wyjaśnij, że dlatego NIE zamawiasz albo
+  zamawiasz mniej (efektywny_stan = stan + w drodze).
 
 POZOSTAŁE ZASADY:
 - Listy wypunktowane gdy pomagają. Tabele markdownowe dla 5+ pozycji.
