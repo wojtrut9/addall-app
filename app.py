@@ -23,17 +23,76 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-    .main { padding: 1.5rem 2rem; }
-    div[data-testid="stMetricValue"] { font-size: 1.4rem; font-weight: 700; }
-    div[data-testid="stMetricDelta"] { font-size: 0.85rem; }
-    .stTabs [data-baseweb="tab"] { font-size: 0.95rem; font-weight: 600; }
-    .mode-badge {
-        display: inline-block;
-        padding: 0.2rem 0.7rem;
-        border-radius: 20px;
-        font-size: 0.85rem;
-        font-weight: 600;
-    }
+  /* ── Typografia i układ ───────────────────────────────────────── */
+  html, body, [class*="css"] {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  }
+  .block-container { padding-top: 1.2rem; padding-bottom: 4rem; max-width: 1320px; }
+
+  /* Ukryj domyślny chrome Streamlit dla czystszego wyglądu */
+  #MainMenu, footer { visibility: hidden; height: 0; }
+  header[data-testid="stHeader"] { background: transparent; height: 0; }
+
+  /* ── Hero / nagłówek ──────────────────────────────────────────── */
+  .hero {
+    background: linear-gradient(120deg, #1D4ED8 0%, #2563EB 55%, #3B82F6 100%);
+    border-radius: 18px;
+    padding: 1.5rem 1.8rem;
+    margin-bottom: 1.4rem;
+    color: #fff;
+    box-shadow: 0 8px 24px rgba(37,99,235,.22);
+  }
+  .hero h1 { margin: 0; font-size: 1.7rem; font-weight: 800; letter-spacing: -.02em; }
+  .hero p  { margin: .35rem 0 0; opacity: .92; font-size: .98rem; }
+
+  /* ── Karty metryk ─────────────────────────────────────────────── */
+  [data-testid="stMetric"] {
+    background: #fff;
+    border: 1px solid #E6E9F0;
+    border-radius: 14px;
+    padding: 14px 16px;
+    box-shadow: 0 1px 2px rgba(16,24,40,.05);
+  }
+  [data-testid="stMetricValue"] { font-size: 1.35rem; font-weight: 700; }
+  [data-testid="stMetricLabel"] { font-weight: 600; color: #475467; }
+  [data-testid="stMetricDelta"] { font-size: .82rem; }
+
+  /* ── Przyciski ────────────────────────────────────────────────── */
+  .stButton > button, .stDownloadButton > button {
+    border-radius: 10px;
+    font-weight: 600;
+    border: 1px solid #E2E6EF;
+    transition: all .12s ease;
+  }
+  .stButton > button:hover, .stDownloadButton > button:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(16,24,40,.10);
+  }
+  .stButton > button[kind="primary"] { box-shadow: 0 2px 8px rgba(37,99,235,.28); }
+
+  /* ── Zakładki (pigułki) ───────────────────────────────────────── */
+  .stTabs [data-baseweb="tab-list"] { gap: 6px; }
+  .stTabs [data-baseweb="tab"] {
+    background: #F1F4FA;
+    border-radius: 10px;
+    padding: 7px 14px;
+    font-weight: 600;
+    font-size: .92rem;
+  }
+  .stTabs [aria-selected="true"] { background: #2563EB !important; color: #fff !important; }
+
+  /* ── Expandery, czat, inputy ──────────────────────────────────── */
+  [data-testid="stExpander"] { border: 1px solid #E6E9F0; border-radius: 12px; }
+  [data-testid="stChatMessage"] {
+    background: #F8FAFF;
+    border: 1px solid #EAF0FF;
+    border-radius: 14px;
+    padding: 2px 12px;
+  }
+  div[data-baseweb="select"] > div, .stTextInput input, .stTextArea textarea, .stNumberInput input {
+    border-radius: 10px;
+  }
+  hr { margin: 1rem 0; border-color: #ECEFF4; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -61,10 +120,13 @@ def get_secret(key: str) -> str | None:
     return os.environ.get(key) or os.environ.get(key.lower())
 
 
-# ── Nagłówek ──────────────────────────────────────────────────────────────────
-st.markdown("# 📦 Add All — Asystent Zakupowy")
-st.caption("Analizuje stany magazynowe i generuje rekomendacje zakupowe")
-st.divider()
+# ── Nagłówek (hero) ───────────────────────────────────────────────────────────
+st.markdown("""
+<div class="hero">
+  <h1>📦 Add All — Asystent Zakupowy</h1>
+  <p>Analiza stanów magazynowych i rekomendacje zakupowe — wspierane przez AI (Claude)</p>
+</div>
+""", unsafe_allow_html=True)
 
 # ── Tryb: iBiznes vs Pliki ────────────────────────────────────────────────────
 ibiznes_url = get_secret("IBIZNES_DB_URL")
