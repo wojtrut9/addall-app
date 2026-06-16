@@ -10,7 +10,7 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 
-from engine import analyze, lookup_supplier_open_orders
+from engine import analyze, lookup_supplier_open_orders, match_minimum
 from excel_export import generate_full_excel, generate_order_excel
 
 # ── Konfiguracja strony ───────────────────────────────────────────────────────
@@ -431,9 +431,9 @@ else:
             key="min_log", label_visibility="collapsed",
         )
         if min_log_file:
-            st.success(f"✅ {min_log_file.name}")
+            st.success(f"✅ {min_log_file.name} (nadpisuje wbite minima)")
         else:
-            st.caption("Dostawca | Min. wartość PLN")
+            st.caption("Domyślnie minima wbite w kod — plik tylko nadpisuje")
 
     st.divider()
 
@@ -663,7 +663,7 @@ with tab_dzis:
         if dos_col:
             for dostawca, grupa in dzis.groupby(dos_col):
                 razem  = grupa["wartosc_zamowienia"].sum()
-                min_v  = summary["min_log"].get(str(dostawca).upper(), 0)
+                min_v  = match_minimum(summary.get("min_log", {}), dostawca)
                 status = (
                     f"⚠️ brakuje {fmt_pln(min_v - razem)} do minimum"
                     if min_v > 0 and razem < min_v
@@ -804,14 +804,10 @@ st.caption(
     "porównywać dostawców i zapamiętywać Twoje nawyki."
 )
 
-api_key = get_secret("OPENAI_API_KEY")
-if not api_key:
-    api_key = st.text_input(
-        "🔑 Klucz API OpenAI:",
-        type="password",
-        placeholder="sk-...",
-        help="Zapisz jako OPENAI_API_KEY w Railway → Variables",
-    )
+# Klucze obu providerów — wybór klucza zależy od wybranego modelu (niżej).
+anthropic_key = get_secret("ANTHROPIC_API_KEY")
+openai_key = get_secret("OPENAI_API_KEY")
+has_any_key = bool(anthropic_key or openai_key)
 
 from ai_agent import (
     ask_agent,
@@ -820,11 +816,20 @@ from ai_agent import (
     remove_preference,
     add_fact,
     remove_fact,
+    get_exclusions,
+    add_exclusion,
+    remove_exclusion,
 )
 
 # ── Panel pamięci agenta ──────────────────────────────────────────────────────
 mem = get_memory()
-mem_count = len(mem.get("preferences", {})) + len(mem.get("facts", []))
+_exc = mem.get("exclusions", {}) or {}
+mem_count = (
+    len(mem.get("preferences", {}))
+    + len(mem.get("facts", []))
+    + len(_exc.get("products", []))
+    + len(_exc.get("suppliers", []))
+)
 with st.expander(
     f"🧠 Pamięć agenta — preferencje i nawyki Anity ({mem_count} zapisanych)",
     expanded=False,
@@ -870,6 +875,43 @@ with st.expander(
                 add_fact(new_fact.strip())
                 st.rerun()
 
+    st.divider()
+    st.markdown("**🚫 Wykluczenia (agent ich NIE rekomenduje):**")
+    exc = get_exclusions()
+    col_exs, col_exp = st.columns(2)
+    with col_exs:
+        st.caption("Dostawcy")
+        if not exc.get("suppliers"):
+            st.caption("_Brak — powiedz agentowi 'pomijaj dostawcę X'_")
+        for i, e in enumerate(exc.get("suppliers", [])):
+            c1, c2 = st.columns([10, 1])
+            r = f" — _{e['reason']}_" if e.get("reason") else ""
+            c1.write(f"• **{e.get('value', '')}**{r}")
+            if c2.button("🗑", key=f"rmexs_{i}"):
+                remove_exclusion("suppliers", e.get("value", ""))
+                st.rerun()
+        with st.form(key="add_exs_form", clear_on_submit=True):
+            exs_v = st.text_input("Wyklucz dostawcę:", placeholder="np. BIACHEM")
+            if st.form_submit_button("➕ Wyklucz dostawcę") and exs_v.strip():
+                add_exclusion("suppliers", exs_v.strip())
+                st.rerun()
+    with col_exp:
+        st.caption("Produkty")
+        if not exc.get("products"):
+            st.caption("_Brak — powiedz agentowi 'nie zamawiaj produktu Y'_")
+        for i, e in enumerate(exc.get("products", [])):
+            c1, c2 = st.columns([10, 1])
+            r = f" — _{e['reason']}_" if e.get("reason") else ""
+            c1.write(f"• {e.get('value', '')}{r}")
+            if c2.button("🗑", key=f"rmexp_{i}"):
+                remove_exclusion("products", e.get("value", ""))
+                st.rerun()
+        with st.form(key="add_exp_form", clear_on_submit=True):
+            exp_v = st.text_input("Wyklucz produkt:", placeholder="kod lub fragment nazwy")
+            if st.form_submit_button("➕ Wyklucz produkt") and exp_v.strip():
+                add_exclusion("products", exp_v.strip())
+                st.rerun()
+
     if mem.get("history"):
         st.markdown("**Ostatnie pytania (historia):**")
         for h in reversed(mem["history"][-10:]):
@@ -885,44 +927,67 @@ with st.expander("🔧 Podgląd statycznego kontekstu wysyłanego do AI", expand
     )
     st.code(context[:5000] + ("\n...[ucięte]" if len(context) > 5000 else ""), language="text")
 
-if not api_key:
-    st.info("Wpisz klucz API OpenAI żeby włączyć agenta (~1-5 gr/pytanie).")
+# Diagnostyka minimów logistycznych (nazwy z tabeli bez dopasowanego dostawcy)
+_unmatched = (summary.get("min_log_unmatched") or []) if isinstance(summary, dict) else []
+if _unmatched:
+    st.warning(
+        "📏 Minima logistyczne bez dopasowanego dostawcy w analizie "
+        f"(sprawdź pisownię/alias): {', '.join(_unmatched)}"
+    )
+
+if not has_any_key:
+    st.info(
+        "Dodaj klucz API żeby włączyć agenta: `ANTHROPIC_API_KEY` (Claude, zalecane) "
+        "lub `OPENAI_API_KEY` (zapas) w Railway → Variables."
+    )
 else:
     if "chat_history" not in st.session_state:
         st.session_state["chat_history"] = []
 
-    # Wybór modelu — najnowsze rodzin: gpt-5 (jeśli dostępny), gpt-4.1, gpt-4o.
-    # Dla agenta z function calling zalecane gpt-4.1 lub gpt-5 — minimodel
-    # bywa „leniwy" i nie woła narzędzi. Fallback automatyczny do gpt-4o.
+    # Wybór modelu — domyślnie Claude Sonnet 4.6 (lepszy od OpenAI), modele GPT
+    # jako zapas. Claude → klucz ANTHROPIC_API_KEY, GPT → OPENAI_API_KEY.
     col_m1, col_m2 = st.columns([3, 4])
     with col_m1:
         model_choice = st.selectbox(
             "🤖 Model AI:",
             options=[
-                "gpt-5",
-                "gpt-5-mini",
+                "claude-sonnet-4-6",
                 "gpt-4.1",
-                "gpt-4.1-mini",
                 "gpt-4o",
-                "gpt-4o-mini",
+                "gpt-5",
                 "(własny — wpisz obok)",
             ],
-            index=2,
+            index=0,
             help=(
-                "gpt-4.1 / gpt-5 — najmocniejsze, najlepsze tool use (~3-8 gr/pytanie).\n"
-                "gpt-4o — sprawdzony, średni koszt.\n"
-                "mini-warianty — tańsze, ale gorzej używają narzędzi."
+                "claude-sonnet-4-6 — zalecany, najlepszy (klucz ANTHROPIC_API_KEY).\n"
+                "gpt-4.1 / gpt-5 / gpt-4o — zapas OpenAI (klucz OPENAI_API_KEY).\n"
+                "Przy błędzie Claude następuje automatyczny fallback na gpt-4o."
             ),
         )
     with col_m2:
         custom_model = st.text_input(
             "Własna nazwa modelu:",
-            value="" if model_choice != "(własny — wpisz obok)" else "gpt-5-pro",
+            value="" if model_choice != "(własny — wpisz obok)" else "claude-sonnet-4-6",
             disabled=(model_choice != "(własny — wpisz obok)"),
-            placeholder="np. gpt-5-pro, o1, gpt-4.1-mini-2025-04-14",
+            placeholder="np. claude-opus-4-8, gpt-4.1-mini, o1",
         )
 
     actual_model = custom_model.strip() if model_choice == "(własny — wpisz obok)" and custom_model.strip() else model_choice
+
+    # Klucz API zależnie od wybranego providera
+    needs_claude = str(actual_model).lower().startswith("claude")
+    api_key = anthropic_key if needs_claude else openai_key
+    if not api_key:
+        api_key = st.text_input(
+            f"🔑 Klucz API {'Anthropic' if needs_claude else 'OpenAI'}:",
+            type="password",
+            placeholder="sk-ant-..." if needs_claude else "sk-...",
+            help=(
+                f"Zapisz jako {'ANTHROPIC_API_KEY' if needs_claude else 'OPENAI_API_KEY'} "
+                "w Railway → Variables"
+            ),
+            key="model_api_key",
+        )
 
     # Dodatkowe instrukcje (sticky system addon)
     extra_instr = st.text_area(
@@ -989,7 +1054,12 @@ else:
         with col_b2:
             st.caption(f"Model: **{actual_model}** | Pamięć: **{mem_count}** zapisów")
 
-    if submitted and user_input.strip():
+    if submitted and not api_key:
+        st.warning(
+            f"Brak klucza API dla modelu `{actual_model}` — wpisz go wyżej "
+            f"({'ANTHROPIC_API_KEY' if needs_claude else 'OPENAI_API_KEY'})."
+        )
+    elif submitted and user_input.strip():
         question = user_input.strip()
         st.session_state["chat_history"].append({"role": "user", "content": question})
 
@@ -1009,15 +1079,15 @@ else:
                     extra_system_instructions=extra_instr.strip() or None,
                 )
 
-                # Fallback jeśli wybrany model padł
-                if err and actual_model != "gpt-4o":
-                    st.caption(f"⚠️ Model `{actual_model}` zwrócił błąd — próbuję `gpt-4o`…")
+                # Fallback (zapas): gdy wybrany model padł, a jest klucz OpenAI → gpt-4o
+                if err and actual_model != "gpt-4o" and openai_key:
+                    st.caption(f"⚠️ Model `{actual_model}` zwrócił błąd — próbuję `gpt-4o` (zapas)…")
                     answer, tool_log, err = ask_agent(
                         question=question,
                         analiza=analiza,
                         summary=summary,
                         context=context,
-                        api_key=api_key,
+                        api_key=openai_key,
                         model="gpt-4o",
                         chat_history=st.session_state["chat_history"][:-1],
                         extra_system_instructions=extra_instr.strip() or None,
@@ -1027,10 +1097,10 @@ else:
                     st.error(
                         f"❌ Błąd agenta: {err}\n\n"
                         "Najczęstsze przyczyny:\n"
-                        "- nieprawidłowy klucz `OPENAI_API_KEY`\n"
-                        "- brak środków na koncie OpenAI (billing)\n"
-                        "- model niedostępny w Twoim koncie (sprawdź na platform.openai.com)\n"
-                        "- limit zapytań (rate limit)"
+                        "- nieprawidłowy klucz API (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`)\n"
+                        "- brak środków / limit (billing, rate limit)\n"
+                        "- model niedostępny w Twoim koncie\n"
+                        "- brak biblioteki `anthropic` (Claude) — sprawdź requirements"
                     )
                 else:
                     st.write(answer)

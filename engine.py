@@ -20,6 +20,66 @@ MONTH_MAP = {
 }
 
 
+# ── Minima logistyczne dostawców (PLN) ───────────────────────────────────────
+# Wbite na sztywno wg ustaleń z Anitą (mail). Klucz = nazwa/alias dostawcy;
+# dopasowanie do dostawcy z iBiznes (kolumna Alias) robi match_minimum() —
+# znormalizowane, bo nazwy z tabeli nie zawsze są 1:1 z aliasem w bazie.
+DEFAULT_MIN_LOG = {
+    "Bagstar": 600.0,
+    "GABONICA": 2000.0,
+    "POLIN": 2000.0,
+    "ADEKS": 3500.0,
+    "KIEL-PAK": 2800.0,
+    "HELKRA": 1000.0,
+    "Primus": 3000.0,
+    "Kram": 3000.0,
+    "J23": 1500.0,
+    "BEA": 1000.0,
+    "Rapi Papstar Polska": 2500.0,
+    "Rapi Papstar Niemcy": 2500.0,
+    "Rapi Winterhalter": 8500.0,
+    "BLUE SERVICE SP. Z O.O": 1000.0,
+    "medaSEPT": 500.0,
+    "Zarys - Rękawiczki": 2000.0,
+    "Jolfol": 7000.0,
+    "PAW": 1000.0,
+    "R&R GROUP": 3168.0,
+}
+
+
+def _norm_supplier(name) -> str:
+    """Normalizacja nazwy dostawcy do dopasowania minimów: upper, bez sufiksów
+    formy prawnej i interpunkcji, pojedyncze spacje."""
+    s = str(name or "").upper()
+    s = re.sub(r"\bSP\.?\s*Z\s*O\.?\s*O\.?\b", " ", s)   # sp. z o.o.
+    s = re.sub(r"\bSP\.?\s*J\.?\b", " ", s)               # sp. j.
+    s = re.sub(r"\bS\.?\s*A\.?\b", " ", s)                # s.a.
+    s = re.sub(r"[^\w]+", " ", s)                          # interpunkcja → spacja
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def match_minimum(min_log: dict, dostawca) -> float:
+    """Minimum logistyczne dla dostawcy (PLN) lub 0.
+
+    Dopasowanie znormalizowane: najpierw równość, potem zawieranie fragmentu
+    w którąkolwiek stronę (krótki alias iBiznes vs pełna nazwa z tabeli)."""
+    if not min_log:
+        return 0.0
+    target = _norm_supplier(dostawca)
+    if not target:
+        return 0.0
+    for k, v in min_log.items():
+        if _norm_supplier(k) == target:
+            return float(v)
+    best = 0.0
+    for k, v in min_log.items():
+        nk = _norm_supplier(k)
+        if nk and (nk in target or target in nk):
+            best = max(best, float(v))
+    return best
+
+
 def parse_polish_date(s):
     """Parsuje datę w formacie '17 lut 2026' na datetime."""
     if pd.isna(s):
@@ -367,8 +427,10 @@ def analyze(
 
     analiza["powod"] = analiza.apply(get_powod, axis=1)
 
-    # ── 8. Minima logistyczne dostawców (opcjonalny plik) ────────────────────
-    min_log = {}
+    # ── 8. Minima logistyczne dostawców ──────────────────────────────────────
+    # Domyślnie wbite w kod (DEFAULT_MIN_LOG). Opcjonalny plik CSV/Excel
+    # (Dostawca | PLN) NADPISUJE domyślne wartości — upload nie jest wymagany.
+    min_log = dict(DEFAULT_MIN_LOG)
     if min_log_file:
         try:
             df_min = read_uploaded_file(min_log_file)
@@ -383,7 +445,7 @@ def analyze(
                             .replace(" ", "")
                             .replace("\xa0", "")
                         )
-                        min_log[supplier.upper()] = val
+                        min_log[supplier] = val
                     except (ValueError, TypeError):
                         pass
         except Exception:
@@ -412,6 +474,15 @@ def analyze(
     # że u BIACHEM jest już otwarte zamówienie ZAZ/123/2026 — żeby mogła
     # dorzucić nowe pozycje zamiast tworzyć osobny dokument.
     supplier_open_orders = _build_supplier_open_orders(zam_df, open_orders_lines_df)
+
+    # ── 9b. Diagnostyka minimów: które nie trafiły w żadnego dostawcę ─────────
+    _dos_col = find_col(analiza, "dostawca")
+    _present = (
+        {str(x) for x in analiza[_dos_col].dropna().unique()} if _dos_col else set()
+    )
+    min_log_unmatched = sorted(
+        k for k in min_log if not any(match_minimum({k: min_log[k]}, d) for d in _present)
+    )
 
     # ── 10. Summary dict ─────────────────────────────────────────────────────
     dzis = analiza[analiza["status"] == "ZAMÓW DZIŚ"]
@@ -450,6 +521,9 @@ def analyze(
         "data_od": date_min.strftime("%d.%m.%Y"),
         "data_do": date_max.strftime("%d.%m.%Y"),
         "min_log": min_log,
+        # Minima z tabeli, które nie dopasowały się do żadnego dostawcy w analizie
+        # (do skorygowania nazw/aliasów — pokazywane w diagnostyce UI).
+        "min_log_unmatched": min_log_unmatched,
         # Mapowanie DOSTAWCA → lista otwartych zamówień u niego.
         # Pozwala podpiąć rekomendację "zamów X u BIACHEM" do istniejącego
         # dokumentu ZAZ/123/2026 zamiast tworzyć nowy.
@@ -726,7 +800,7 @@ def _build_llm_context(analiza, zam_df, summary):
         if dostawca_col:
             for dostawca, g in dzis.groupby(dostawca_col):
                 razem = g["wartosc_zamowienia"].sum()
-                min_v = summary["min_log"].get(str(dostawca).upper(), 0)
+                min_v = match_minimum(summary["min_log"], dostawca)
                 status_min = (
                     f"min logistyczne OK ({razem:.0f} >= {min_v:.0f} PLN)"
                     if min_v == 0 or razem >= min_v
