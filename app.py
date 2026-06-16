@@ -12,6 +12,17 @@ import streamlit as st
 
 from engine import analyze, lookup_supplier_open_orders, match_minimum
 from excel_export import generate_full_excel, generate_order_excel
+from ai_agent import (
+    ask_agent,
+    get_memory,
+    save_preference,
+    remove_preference,
+    add_fact,
+    remove_fact,
+    get_exclusions,
+    add_exclusion,
+    remove_exclusion,
+)
 
 # ── Konfiguracja strony ───────────────────────────────────────────────────────
 st.set_page_config(
@@ -71,13 +82,13 @@ st.markdown("""
   .stButton > button[kind="primary"] { box-shadow: 0 2px 8px rgba(37,99,235,.28); }
 
   /* ── Zakładki (pigułki) ───────────────────────────────────────── */
-  .stTabs [data-baseweb="tab-list"] { gap: 6px; }
+  .stTabs [data-baseweb="tab-list"] { gap: 6px; flex-wrap: wrap; }
   .stTabs [data-baseweb="tab"] {
     background: #F1F4FA;
     border-radius: 10px;
-    padding: 7px 14px;
+    padding: 8px 16px;
     font-weight: 600;
-    font-size: .92rem;
+    font-size: .95rem;
   }
   .stTabs [aria-selected="true"] { background: #2563EB !important; color: #fff !important; }
 
@@ -128,529 +139,414 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# ── Tryb: iBiznes vs Pliki ────────────────────────────────────────────────────
-ibiznes_url = get_secret("IBIZNES_DB_URL")
-
-mode = st.radio(
-    "Tryb pobierania danych:",
-    options=["ibiznes", "pliki"],
-    format_func=lambda x: (
-        "⚡ Pobierz z iBiznes (automatycznie)" if x == "ibiznes"
-        else "📁 Wgraj pliki ręcznie (CSV/Excel)"
-    ),
-    horizontal=True,
-    help=(
-        "Tryb iBiznes pobiera dane bezpośrednio z bazy danych iBiznes. "
-        "Tryb pliki — wgraj eksport CSV lub Excel z iBiznes."
-    ),
+# ═══════════════════════════════════════════════════════════════════
+# PANEL DANYCH — zwijany u góry (po wczytaniu sam się składa)
+# ═══════════════════════════════════════════════════════════════════
+_loaded = "analiza" in st.session_state
+_src_lbl = st.session_state.get("data_source")
+_data_title = (
+    f"⚙️ Źródło danych — ✓ wczytano ({'⚡ iBiznes' if _src_lbl == 'ibiznes' else '📁 pliki'})"
+    if _loaded else "⚙️ Źródło danych i połączenie — zacznij tutaj"
 )
 
-st.divider()
+with st.expander(_data_title, expanded=not _loaded):
+    ibiznes_url = get_secret("IBIZNES_DB_URL")
 
-# ═══════════════════════════════════════════════════════════════════
-# TRYB 1: iBiznes (automatyczny)
-# ═══════════════════════════════════════════════════════════════════
-if mode == "ibiznes":
-
-    st.subheader("1. Połączenie z iBiznes")
-
-    # URL ze secrets lub ręczne wpisanie
-    if ibiznes_url:
-        st.success("✅ IBIZNES_DB_URL skonfigurowany (z Railway secrets)")
-        db_url_input = ibiznes_url
-    else:
-        st.info(
-            "Wpisz connection string do bazy MySQL iBiznes. "
-            "Możesz też dodać go w Railway → Variables jako `IBIZNES_DB_URL`."
-        )
-        db_url_input = st.text_input(
-            "IBIZNES_DB_URL:",
-            placeholder="mysql://user:password@host:3306/dbname",
-            type="password",
-        )
-
-    col_days, col_test, col_run = st.columns([2, 2, 3])
-
-    with col_days:
-        days = st.number_input(
-            "Okres analizy (dni wstecz)",
-            min_value=7,
-            max_value=365,
-            value=90,
-            step=7,
-            help="Ile dni wstecz pobrać dane o obrotach magazynowych. Zalecane: 60-90 dni.",
-        )
-
-    with col_test:
-        if st.button("🔌 Test połączenia", disabled=not db_url_input):
-            with st.spinner("Testuję połączenie…"):
-                try:
-                    from ibiznes_connector import test_connection
-                    ok, msg = test_connection(db_url_input)
-                    if ok:
-                        st.success(msg)
-                    else:
-                        st.error(msg)
-                except ImportError:
-                    st.error("Brak biblioteki pymysql. Uruchom: pip install pymysql")
-                except Exception as e:
-                    st.error(f"Błąd: {e}")
-
-        if st.button("🔍 Pokaż schemat tabel zamówień", disabled=not db_url_input):
-            with st.spinner("Czytam schemat…"):
-                try:
-                    from ibiznes_connector import (
-                        get_connection, identify_tables, get_columns,
-                    )
-                    conn = get_connection(db_url_input)
-                    try:
-                        tbl_info = identify_tables(conn)
-                        zam_h = tbl_info.get("zam_spzoo") or tbl_info.get("zam_firma")
-                        zam_l = tbl_info.get("zamspec_spzoo") or tbl_info.get("zamspec_firma")
-                        out = {}
-                        with conn.cursor() as cur:
-                            for label, tbl in (("HEADER", zam_h), ("LINE_ITEMS", zam_l)):
-                                if not tbl:
-                                    out[label] = ("(brak tabeli)", [], [])
-                                    continue
-                                cols = get_columns(conn, tbl)
-                                # Rozkład statusu realizacji. W iBiznes status zamówienia
-                                # zakupu siedzi w kolumnie `Typ` (0/1=otwarte, 2=zrealizowane,
-                                # 3=anulowane), a NIE w pustej kolumnie `etap`.
-                                etap_col = next(
-                                    (c for c in cols if c.lower() == "typ"),
-                                    None,
-                                ) or next(
-                                    (c for c in cols if c.lower() in ("etap","status","stan","realizacja")),
-                                    None,
-                                )
-                                etap_dist = []
-                                if label == "HEADER" and etap_col:
-                                    try:
-                                        cur.execute(
-                                            f"SELECT `{etap_col}` AS etap, COUNT(*) AS n "
-                                            f"FROM `{tbl}` GROUP BY `{etap_col}` ORDER BY n DESC"
-                                        )
-                                        etap_dist = list(cur.fetchall())
-                                    except Exception:
-                                        pass
-                                # Próbka 2 wierszy
-                                try:
-                                    cur.execute(f"SELECT * FROM `{tbl}` LIMIT 2")
-                                    sample = list(cur.fetchall())
-                                except Exception:
-                                    sample = []
-                                out[label] = (tbl, cols, etap_dist, sample)
-                    finally:
-                        conn.close()
-
-                    for label, data in out.items():
-                        st.markdown(f"### {label}: `{data[0]}`")
-                        if len(data) > 1 and data[1]:
-                            st.code("Kolumny:\n  " + "\n  ".join(data[1]), language="text")
-                        if len(data) > 2 and data[2]:
-                            st.markdown(
-                                "**Rozkład statusu realizacji (`Typ`):** "
-                                "`0`/`1` = otwarte (w realizacji), `2` = zrealizowane, "
-                                "`3` = anulowane. Jeśli liczby nie zgadzają się z iBiznes "
-                                "→ ustaw `IBIZNES_OPEN_ORDER_TYPES` w Railway."
-                            )
-                            for row in data[2]:
-                                vals = list(row.values()) if isinstance(row, dict) else list(row)
-                                st.write(f"  • `{vals[0]!r}` → {vals[1]} dokumentów")
-                        if len(data) > 3 and data[3]:
-                            import json
-                            st.markdown("**Próbka (2 wiersze):**")
-                            st.code(
-                                json.dumps(
-                                    [dict(r) for r in data[3]],
-                                    indent=2, ensure_ascii=False, default=str,
-                                ),
-                                language="json",
-                            )
-                except Exception as e:
-                    import traceback as _tb
-                    st.error(f"Błąd: {e}")
-                    st.code(_tb.format_exc(), language="text")
-
-        if st.button("📋 Pokaż wszystkie tabele bazy", disabled=not db_url_input):
-            with st.spinner("Czytam listę tabel…"):
-                try:
-                    from ibiznes_connector import (
-                        get_connection, discover_tables, identify_tables,
-                    )
-                    conn = get_connection(db_url_input)
-                    try:
-                        tables = discover_tables(conn)
-                        tbl_info = identify_tables(conn)
-                    finally:
-                        conn.close()
-                    addall = [t for t in tables if t.lower().startswith("addall")]
-                    firma  = [t for t in tables if t.lower().startswith("firma")]
-                    other  = [
-                        t for t in tables
-                        if not t.lower().startswith(("addall", "firma"))
-                    ]
-                    st.success(f"Znaleziono {len(tables)} tabel w bazie iBiznes.")
-                    st.markdown(
-                        f"**Auto-wykryte:**\n"
-                        f"- Obroty (spec): `{tbl_info.get('spec_spzoo') or '❌'}`\n"
-                        f"- Towary (kartoteka): `{tbl_info.get('towary_spzoo') or tbl_info.get('towary_firma') or '❌'}`\n"
-                        f"- Zamówienia (header): `{tbl_info.get('zam_spzoo') or tbl_info.get('zam_firma') or '❌'}`\n"
-                        f"- Pozycje zamówień: `{tbl_info.get('zamspec_spzoo') or tbl_info.get('zamspec_firma') or '❌'}`"
-                    )
-                    if addall:
-                        st.code("addall*:\n  " + "\n  ".join(addall), language="text")
-                    if firma:
-                        st.code("firma*:\n  " + "\n  ".join(firma), language="text")
-                    if other:
-                        st.code("inne:\n  " + "\n  ".join(other), language="text")
-                except Exception as e:
-                    st.error(f"Błąd: {e}")
-
-    with col_run:
-        run_ibiznes = st.button(
-            "⚡ Pobierz dane z iBiznes i analizuj",
-            type="primary",
-            disabled=not db_url_input,
-            use_container_width=True,
-        )
-
-    if run_ibiznes and db_url_input:
-        with st.spinner(f"Łączę się z iBiznes i pobieram dane za ostatnie {days} dni…"):
-            try:
-                from ibiznes_connector import fetch_all, identify_tables, get_connection
-
-                # Najpierw pokaż dostępne tabele (pomocne przy pierwszym uruchomieniu)
-                conn_test = get_connection(db_url_input)
-                tbl_info = identify_tables(conn_test)
-                conn_test.close()
-
-                all_tables  = tbl_info.get("_all_tables", [])
-                spec_spzoo  = tbl_info.get("spec_spzoo")
-                towary      = tbl_info.get("towary_spzoo") or tbl_info.get("towary_firma")
-                zam         = tbl_info.get("zam_spzoo") or tbl_info.get("zam_firma")
-                zamspec     = tbl_info.get("zamspec_spzoo") or tbl_info.get("zamspec_firma")
-
-                if not spec_spzoo or not towary:
-                    st.warning(
-                        f"**Uwaga:** Nie wszystkie tabele zostały zidentyfikowane automatycznie.\n\n"
-                        f"Tabele w bazie: `{'`, `'.join(all_tables)}`\n\n"
-                        f"Zidentyfikowane:\n"
-                        f"- Obroty (spec): `{spec_spzoo or '❌ nie znaleziono'}`\n"
-                        f"- Towary: `{towary or '❌ nie znaleziono'}`\n"
-                        f"- Zamówienia (header): `{zam or '⚠️ nie znaleziono'}`\n"
-                        f"- Pozycje zamówień: `{zamspec or '⚠️ nie znaleziono'}`\n\n"
-                        "Zgłoś to — dopasujemy nazwy tabel do Twojej bazy iBiznes."
-                    )
-
-                # Pobierz dane (6 elementów: kartoteka, obroty, zamowienia-header,
-                # in_transit-per-SKU, open_orders_lines-per-(NrZam,SKU), tbl_info)
-                (
-                    kartoteka_df,
-                    obroty_df,
-                    zamowienia_df,
-                    in_transit_df,
-                    open_lines_df,
-                    _,
-                ) = fetch_all(db_url_input, days=days)
-
-                in_transit_count = len(in_transit_df) if in_transit_df is not None else 0
-                lines_count = len(open_lines_df) if open_lines_df is not None else 0
-                st.caption(
-                    f"Pobrano: {len(kartoteka_df)} aktywnych produktów (kartoteka po filtrze Akt), "
-                    f"{len(obroty_df)} ruchów magazynowych, "
-                    f"**{len(zamowienia_df)} otwartych zamówień do dostawców**, "
-                    f"{in_transit_count} pozycji 'w drodze' (per SKU), "
-                    f"{lines_count} line items w otwartych dokumentach"
-                )
-
-                # Diagnostyka — kiedy zamówień jest 0 a w iBiznes są dokumenty,
-                # pokaż jaką tabelę znaleźliśmy + wszystkie tabele z prefiksem
-                # addall/firma, żeby łatwo podać prawidłową nazwę.
-                if len(zamowienia_df) == 0:
-                    spzoo_tables = [t for t in all_tables if t.lower().startswith("addall")]
-                    firma_tables = [t for t in all_tables if t.lower().startswith("firma")]
-                    other_tables = [
-                        t for t in all_tables
-                        if not t.lower().startswith(("addall", "firma"))
-                    ]
-                    with st.expander(
-                        "⚠️ Nie wykryto otwartych zamówień — kliknij aby zobaczyć tabele bazy",
-                        expanded=True,
-                    ):
-                        st.markdown(
-                            f"**Zidentyfikowane tabele zamówień (header):**\n"
-                            f"- sp. z o.o.: `{zam or '❌ nie znaleziono'}`\n"
-                            f"- firma: `{tbl_info.get('zam_firma') or '❌ nie znaleziono'}`\n"
-                            f"\n**Pozycje zamówień (line items):**\n"
-                            f"- sp. z o.o.: `{zamspec or '❌ nie znaleziono'}`\n"
-                            f"- firma: `{tbl_info.get('zamspec_firma') or '❌ nie znaleziono'}`"
-                        )
-                        st.markdown(
-                            "**Wszystkie tabele bazy iBiznes** — znajdź nazwę "
-                            "odpowiadającą *Zamówieniom do dostawców* "
-                            "(np. z prefiksem `addall…` lub `firma…`) i daj znać, "
-                            "która to — dopasujemy auto-discovery:"
-                        )
-                        if spzoo_tables:
-                            st.code("addall*:\n  " + "\n  ".join(spzoo_tables), language="text")
-                        if firma_tables:
-                            st.code("firma*:\n  " + "\n  ".join(firma_tables), language="text")
-                        if other_tables:
-                            st.code("inne:\n  " + "\n  ".join(other_tables), language="text")
-
-                # Konwertuj na format plikowy i przekaż do engine
-                import io
-
-                def df_to_upload_file(df, name: str):
-                    """Symuluje obiekt wgranego pliku dla engine.analyze()."""
-                    buf = io.BytesIO()
-                    df.to_csv(buf, sep=";", index=False, encoding="utf-8")
-                    buf.seek(0)
-                    buf.name = name
-                    return buf
-
-                kart_buf  = df_to_upload_file(kartoteka_df, "KartotekaTowarowiUslug.csv")
-                obr_buf   = df_to_upload_file(obroty_df,    "magazyn obroty wszystko.csv")
-                zam_buf   = df_to_upload_file(zamowienia_df, "ZamówieniaDlaDostawcy.csv") if len(zamowienia_df) > 0 else None
-
-                analiza, zam_result, summary, context = analyze(
-                    kart_buf, obr_buf,
-                    zam_buf if zam_buf else None,
-                    None,  # min_log_file
-                    in_transit_df=in_transit_df,
-                    open_orders_lines_df=open_lines_df,
-                )
-
-                st.session_state.update({
-                    "analiza": analiza,
-                    "zam_df":  zam_result,
-                    "summary": summary,
-                    "context": context,
-                    "chat_history": [],
-                    "data_source": "ibiznes",
-                })
-                st.success("✅ Dane pobrane i przeanalizowane!")
-
-            except Exception as exc:
-                st.error(f"❌ Błąd: {exc}")
-                st.info(
-                    "Wskazówka: upewnij się że IBIZNES_DB_URL jest poprawny "
-                    "i że serwer MySQL iBiznes jest dostępny z sieci Railway/internet."
-                )
-                st.stop()
-
-# ═══════════════════════════════════════════════════════════════════
-# TRYB 2: Pliki (ręczny fallback)
-# ═══════════════════════════════════════════════════════════════════
-else:
-    st.subheader("1. Wgraj pliki z iBiznes")
-    st.caption(
-        "Wymagane: Kartoteka + Obroty. Opcjonalne: Zamówienia + Minima logistyczne.\n"
-        "Eksportuj z iBiznes: Magazyn → Kartoteka / Obroty / Zamówienia → Eksportuj CSV"
+    mode = st.radio(
+        "Tryb pobierania danych:",
+        options=["ibiznes", "pliki"],
+        format_func=lambda x: (
+            "⚡ Pobierz z iBiznes (automatycznie)" if x == "ibiznes"
+            else "📁 Wgraj pliki ręcznie (CSV/Excel)"
+        ),
+        horizontal=True,
+        help=(
+            "Tryb iBiznes pobiera dane bezpośrednio z bazy danych iBiznes. "
+            "Tryb pliki — wgraj eksport CSV lub Excel z iBiznes."
+        ),
     )
-
-    c1, c2, c3, c4 = st.columns(4)
-
-    with c1:
-        st.markdown("**📋 Kartoteka towarów** *(wymagana)*")
-        kart_file = st.file_uploader(
-            "kartoteka", type=["csv", "xlsx", "xls"],
-            key="kart", label_visibility="collapsed",
-        )
-        if kart_file:
-            st.success(f"✅ {kart_file.name}")
-        else:
-            st.info("KartotekaTowarowiUslug.csv")
-
-    with c2:
-        st.markdown("**📊 Obroty magazynowe** *(wymagane)*")
-        obroty_file = st.file_uploader(
-            "obroty", type=["csv", "xlsx", "xls"],
-            key="obroty", label_visibility="collapsed",
-        )
-        if obroty_file:
-            st.success(f"✅ {obroty_file.name}")
-        else:
-            st.info("magazyn obroty wszystko.csv")
-
-    with c3:
-        st.markdown("**🚚 Zamówienia** *(opcjonalne)*")
-        zam_file = st.file_uploader(
-            "zamowienia", type=["csv", "xlsx", "xls"],
-            key="zam", label_visibility="collapsed",
-        )
-        if zam_file:
-            st.success(f"✅ {zam_file.name}")
-        else:
-            st.caption("ZamówieniaDlaDostawcy.csv")
-
-    with c4:
-        st.markdown("**📏 Min. logistyczne** *(opcjonalne)*")
-        min_log_file = st.file_uploader(
-            "minima", type=["csv", "xlsx", "xls"],
-            key="min_log", label_visibility="collapsed",
-        )
-        if min_log_file:
-            st.success(f"✅ {min_log_file.name} (nadpisuje wbite minima)")
-        else:
-            st.caption("Domyślnie minima wbite w kod — plik tylko nadpisuje")
 
     st.divider()
 
-    col_btn, col_msg = st.columns([2, 5])
-    with col_btn:
+    # ───────────────────────── TRYB 1: iBiznes ─────────────────────────
+    if mode == "ibiznes":
+        st.markdown("**1. Połączenie z iBiznes**")
+
+        if ibiznes_url:
+            st.success("✅ IBIZNES_DB_URL skonfigurowany (z Railway secrets)")
+            db_url_input = ibiznes_url
+        else:
+            st.info(
+                "Wpisz connection string do bazy MySQL iBiznes. "
+                "Możesz też dodać go w Railway → Variables jako `IBIZNES_DB_URL`."
+            )
+            db_url_input = st.text_input(
+                "IBIZNES_DB_URL:",
+                placeholder="mysql://user:password@host:3306/dbname",
+                type="password",
+            )
+
+        col_days, col_run = st.columns([2, 3])
+        with col_days:
+            days = st.number_input(
+                "Okres analizy (dni wstecz)",
+                min_value=7,
+                max_value=365,
+                value=90,
+                step=7,
+                help="Ile dni wstecz pobrać dane o obrotach magazynowych. Zalecane: 60-90 dni.",
+            )
+        with col_run:
+            st.write("")
+            run_ibiznes = st.button(
+                "⚡ Pobierz dane z iBiznes i analizuj",
+                type="primary",
+                disabled=not db_url_input,
+                use_container_width=True,
+            )
+
+        with st.expander("🔧 Diagnostyka połączenia (zaawansowane)", expanded=False):
+            if st.button("🔌 Test połączenia", disabled=not db_url_input):
+                with st.spinner("Testuję połączenie…"):
+                    try:
+                        from ibiznes_connector import test_connection
+                        ok, msg = test_connection(db_url_input)
+                        if ok:
+                            st.success(msg)
+                        else:
+                            st.error(msg)
+                    except ImportError:
+                        st.error("Brak biblioteki pymysql. Uruchom: pip install pymysql")
+                    except Exception as e:
+                        st.error(f"Błąd: {e}")
+
+            if st.button("🔍 Pokaż schemat tabel zamówień", disabled=not db_url_input):
+                with st.spinner("Czytam schemat…"):
+                    try:
+                        from ibiznes_connector import (
+                            get_connection, identify_tables, get_columns,
+                        )
+                        conn = get_connection(db_url_input)
+                        try:
+                            tbl_info = identify_tables(conn)
+                            zam_h = tbl_info.get("zam_spzoo") or tbl_info.get("zam_firma")
+                            zam_l = tbl_info.get("zamspec_spzoo") or tbl_info.get("zamspec_firma")
+                            out = {}
+                            with conn.cursor() as cur:
+                                for label, tbl in (("HEADER", zam_h), ("LINE_ITEMS", zam_l)):
+                                    if not tbl:
+                                        out[label] = ("(brak tabeli)", [], [])
+                                        continue
+                                    cols = get_columns(conn, tbl)
+                                    etap_col = next(
+                                        (c for c in cols if c.lower() == "typ"),
+                                        None,
+                                    ) or next(
+                                        (c for c in cols if c.lower() in ("etap","status","stan","realizacja")),
+                                        None,
+                                    )
+                                    etap_dist = []
+                                    if label == "HEADER" and etap_col:
+                                        try:
+                                            cur.execute(
+                                                f"SELECT `{etap_col}` AS etap, COUNT(*) AS n "
+                                                f"FROM `{tbl}` GROUP BY `{etap_col}` ORDER BY n DESC"
+                                            )
+                                            etap_dist = list(cur.fetchall())
+                                        except Exception:
+                                            pass
+                                    try:
+                                        cur.execute(f"SELECT * FROM `{tbl}` LIMIT 2")
+                                        sample = list(cur.fetchall())
+                                    except Exception:
+                                        sample = []
+                                    out[label] = (tbl, cols, etap_dist, sample)
+                        finally:
+                            conn.close()
+
+                        for label, data in out.items():
+                            st.markdown(f"### {label}: `{data[0]}`")
+                            if len(data) > 1 and data[1]:
+                                st.code("Kolumny:\n  " + "\n  ".join(data[1]), language="text")
+                            if len(data) > 2 and data[2]:
+                                st.markdown(
+                                    "**Rozkład statusu realizacji (`Typ`):** "
+                                    "`0`/`1` = otwarte (w realizacji), `2` = zrealizowane, "
+                                    "`3` = anulowane. Jeśli liczby nie zgadzają się z iBiznes "
+                                    "→ ustaw `IBIZNES_OPEN_ORDER_TYPES` w Railway."
+                                )
+                                for row in data[2]:
+                                    vals = list(row.values()) if isinstance(row, dict) else list(row)
+                                    st.write(f"  • `{vals[0]!r}` → {vals[1]} dokumentów")
+                            if len(data) > 3 and data[3]:
+                                import json
+                                st.markdown("**Próbka (2 wiersze):**")
+                                st.code(
+                                    json.dumps(
+                                        [dict(r) for r in data[3]],
+                                        indent=2, ensure_ascii=False, default=str,
+                                    ),
+                                    language="json",
+                                )
+                    except Exception as e:
+                        import traceback as _tb
+                        st.error(f"Błąd: {e}")
+                        st.code(_tb.format_exc(), language="text")
+
+            if st.button("📋 Pokaż wszystkie tabele bazy", disabled=not db_url_input):
+                with st.spinner("Czytam listę tabel…"):
+                    try:
+                        from ibiznes_connector import (
+                            get_connection, discover_tables, identify_tables,
+                        )
+                        conn = get_connection(db_url_input)
+                        try:
+                            tables = discover_tables(conn)
+                            tbl_info = identify_tables(conn)
+                        finally:
+                            conn.close()
+                        addall = [t for t in tables if t.lower().startswith("addall")]
+                        firma  = [t for t in tables if t.lower().startswith("firma")]
+                        other  = [
+                            t for t in tables
+                            if not t.lower().startswith(("addall", "firma"))
+                        ]
+                        st.success(f"Znaleziono {len(tables)} tabel w bazie iBiznes.")
+                        st.markdown(
+                            f"**Auto-wykryte:**\n"
+                            f"- Obroty (spec): `{tbl_info.get('spec_spzoo') or '❌'}`\n"
+                            f"- Towary (kartoteka): `{tbl_info.get('towary_spzoo') or tbl_info.get('towary_firma') or '❌'}`\n"
+                            f"- Zamówienia (header): `{tbl_info.get('zam_spzoo') or tbl_info.get('zam_firma') or '❌'}`\n"
+                            f"- Pozycje zamówień: `{tbl_info.get('zamspec_spzoo') or tbl_info.get('zamspec_firma') or '❌'}`"
+                        )
+                        if addall:
+                            st.code("addall*:\n  " + "\n  ".join(addall), language="text")
+                        if firma:
+                            st.code("firma*:\n  " + "\n  ".join(firma), language="text")
+                        if other:
+                            st.code("inne:\n  " + "\n  ".join(other), language="text")
+                    except Exception as e:
+                        st.error(f"Błąd: {e}")
+
+        if run_ibiznes and db_url_input:
+            with st.spinner(f"Łączę się z iBiznes i pobieram dane za ostatnie {days} dni…"):
+                try:
+                    from ibiznes_connector import fetch_all, identify_tables, get_connection
+
+                    conn_test = get_connection(db_url_input)
+                    tbl_info = identify_tables(conn_test)
+                    conn_test.close()
+
+                    all_tables  = tbl_info.get("_all_tables", [])
+                    spec_spzoo  = tbl_info.get("spec_spzoo")
+                    towary      = tbl_info.get("towary_spzoo") or tbl_info.get("towary_firma")
+                    zam         = tbl_info.get("zam_spzoo") or tbl_info.get("zam_firma")
+                    zamspec     = tbl_info.get("zamspec_spzoo") or tbl_info.get("zamspec_firma")
+
+                    if not spec_spzoo or not towary:
+                        st.warning(
+                            f"**Uwaga:** Nie wszystkie tabele zostały zidentyfikowane automatycznie.\n\n"
+                            f"Tabele w bazie: `{'`, `'.join(all_tables)}`\n\n"
+                            f"Zidentyfikowane:\n"
+                            f"- Obroty (spec): `{spec_spzoo or '❌ nie znaleziono'}`\n"
+                            f"- Towary: `{towary or '❌ nie znaleziono'}`\n"
+                            f"- Zamówienia (header): `{zam or '⚠️ nie znaleziono'}`\n"
+                            f"- Pozycje zamówień: `{zamspec or '⚠️ nie znaleziono'}`\n\n"
+                            "Zgłoś to — dopasujemy nazwy tabel do Twojej bazy iBiznes."
+                        )
+
+                    (
+                        kartoteka_df,
+                        obroty_df,
+                        zamowienia_df,
+                        in_transit_df,
+                        open_lines_df,
+                        _,
+                    ) = fetch_all(db_url_input, days=days)
+
+                    in_transit_count = len(in_transit_df) if in_transit_df is not None else 0
+                    lines_count = len(open_lines_df) if open_lines_df is not None else 0
+                    st.caption(
+                        f"Pobrano: {len(kartoteka_df)} aktywnych produktów (kartoteka po filtrze Akt), "
+                        f"{len(obroty_df)} ruchów magazynowych, "
+                        f"**{len(zamowienia_df)} otwartych zamówień do dostawców**, "
+                        f"{in_transit_count} pozycji 'w drodze' (per SKU), "
+                        f"{lines_count} line items w otwartych dokumentach"
+                    )
+
+                    if len(zamowienia_df) == 0:
+                        spzoo_tables = [t for t in all_tables if t.lower().startswith("addall")]
+                        firma_tables = [t for t in all_tables if t.lower().startswith("firma")]
+                        other_tables = [
+                            t for t in all_tables
+                            if not t.lower().startswith(("addall", "firma"))
+                        ]
+                        with st.expander(
+                            "⚠️ Nie wykryto otwartych zamówień — kliknij aby zobaczyć tabele bazy",
+                            expanded=True,
+                        ):
+                            st.markdown(
+                                f"**Zidentyfikowane tabele zamówień (header):**\n"
+                                f"- sp. z o.o.: `{zam or '❌ nie znaleziono'}`\n"
+                                f"- firma: `{tbl_info.get('zam_firma') or '❌ nie znaleziono'}`\n"
+                                f"\n**Pozycje zamówień (line items):**\n"
+                                f"- sp. z o.o.: `{zamspec or '❌ nie znaleziono'}`\n"
+                                f"- firma: `{tbl_info.get('zamspec_firma') or '❌ nie znaleziono'}`"
+                            )
+                            st.markdown(
+                                "**Wszystkie tabele bazy iBiznes** — znajdź nazwę "
+                                "odpowiadającą *Zamówieniom do dostawców* "
+                                "(np. z prefiksem `addall…` lub `firma…`) i daj znać, "
+                                "która to — dopasujemy auto-discovery:"
+                            )
+                            if spzoo_tables:
+                                st.code("addall*:\n  " + "\n  ".join(spzoo_tables), language="text")
+                            if firma_tables:
+                                st.code("firma*:\n  " + "\n  ".join(firma_tables), language="text")
+                            if other_tables:
+                                st.code("inne:\n  " + "\n  ".join(other_tables), language="text")
+
+                    import io
+
+                    def df_to_upload_file(df, name: str):
+                        """Symuluje obiekt wgranego pliku dla engine.analyze()."""
+                        buf = io.BytesIO()
+                        df.to_csv(buf, sep=";", index=False, encoding="utf-8")
+                        buf.seek(0)
+                        buf.name = name
+                        return buf
+
+                    kart_buf  = df_to_upload_file(kartoteka_df, "KartotekaTowarowiUslug.csv")
+                    obr_buf   = df_to_upload_file(obroty_df,    "magazyn obroty wszystko.csv")
+                    zam_buf   = df_to_upload_file(zamowienia_df, "ZamówieniaDlaDostawcy.csv") if len(zamowienia_df) > 0 else None
+
+                    analiza, zam_result, summary, context = analyze(
+                        kart_buf, obr_buf,
+                        zam_buf if zam_buf else None,
+                        None,  # min_log_file
+                        in_transit_df=in_transit_df,
+                        open_orders_lines_df=open_lines_df,
+                    )
+
+                    st.session_state.update({
+                        "analiza": analiza,
+                        "zam_df":  zam_result,
+                        "summary": summary,
+                        "context": context,
+                        "chat_history": [],
+                        "data_source": "ibiznes",
+                    })
+                    st.success("✅ Dane pobrane i przeanalizowane! Zobacz zakładki niżej.")
+
+                except Exception as exc:
+                    st.error(f"❌ Błąd: {exc}")
+                    st.info(
+                        "Wskazówka: upewnij się że IBIZNES_DB_URL jest poprawny "
+                        "i że serwer MySQL iBiznes jest dostępny z sieci Railway/internet."
+                    )
+                    st.stop()
+
+    # ───────────────────────── TRYB 2: Pliki ─────────────────────────
+    else:
+        st.markdown("**1. Wgraj pliki z iBiznes**")
+        st.caption(
+            "Wymagane: Kartoteka + Obroty. Opcjonalne: Zamówienia + Minima logistyczne.\n"
+            "Eksportuj z iBiznes: Magazyn → Kartoteka / Obroty / Zamówienia → Eksportuj CSV"
+        )
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**📋 Kartoteka towarów** *(wymagana)*")
+            kart_file = st.file_uploader(
+                "kartoteka", type=["csv", "xlsx", "xls"],
+                key="kart", label_visibility="collapsed",
+            )
+            if kart_file:
+                st.success(f"✅ {kart_file.name}")
+            else:
+                st.info("KartotekaTowarowiUslug.csv")
+
+            st.markdown("**🚚 Zamówienia** *(opcjonalne)*")
+            zam_file = st.file_uploader(
+                "zamowienia", type=["csv", "xlsx", "xls"],
+                key="zam", label_visibility="collapsed",
+            )
+            if zam_file:
+                st.success(f"✅ {zam_file.name}")
+            else:
+                st.caption("ZamówieniaDlaDostawcy.csv")
+
+        with c2:
+            st.markdown("**📊 Obroty magazynowe** *(wymagane)*")
+            obroty_file = st.file_uploader(
+                "obroty", type=["csv", "xlsx", "xls"],
+                key="obroty", label_visibility="collapsed",
+            )
+            if obroty_file:
+                st.success(f"✅ {obroty_file.name}")
+            else:
+                st.info("magazyn obroty wszystko.csv")
+
+            st.markdown("**📏 Min. logistyczne** *(opcjonalne)*")
+            min_log_file = st.file_uploader(
+                "minima", type=["csv", "xlsx", "xls"],
+                key="min_log", label_visibility="collapsed",
+            )
+            if min_log_file:
+                st.success(f"✅ {min_log_file.name} (nadpisuje wbite minima)")
+            else:
+                st.caption("Domyślnie minima wbite w kod — plik tylko nadpisuje")
+
+        st.divider()
+
         run_files = st.button(
             "▶ Analizuj pliki",
             type="primary",
             use_container_width=True,
             disabled=(not locals().get("kart_file") or not locals().get("obroty_file")),
         )
-    with col_msg:
         if not locals().get("kart_file") or not locals().get("obroty_file"):
             st.warning("Wgraj co najmniej Kartotekę i Obroty.")
 
-    if locals().get("run_files"):
-        with st.spinner("Analizuję pliki…"):
-            try:
-                analiza, zam_result, summary, context = analyze(
-                    kart_file, obroty_file,
-                    zam_file if locals().get("zam_file") else None,
-                    min_log_file if locals().get("min_log_file") else None,
-                    in_transit_df=None,  # tryb plikowy nie ma danych "w drodze" per SKU
-                )
-                st.session_state.update({
-                    "analiza": analiza,
-                    "zam_df":  zam_result,
-                    "summary": summary,
-                    "context": context,
-                    "chat_history": [],
-                    "data_source": "pliki",
-                })
-                st.success("✅ Analiza gotowa!")
-            except Exception as exc:
-                st.error(f"❌ Błąd analizy: {exc}")
-                st.stop()
+        if locals().get("run_files"):
+            with st.spinner("Analizuję pliki…"):
+                try:
+                    analiza, zam_result, summary, context = analyze(
+                        kart_file, obroty_file,
+                        zam_file if locals().get("zam_file") else None,
+                        min_log_file if locals().get("min_log_file") else None,
+                        in_transit_df=None,  # tryb plikowy nie ma danych "w drodze" per SKU
+                    )
+                    st.session_state.update({
+                        "analiza": analiza,
+                        "zam_df":  zam_result,
+                        "summary": summary,
+                        "context": context,
+                        "chat_history": [],
+                        "data_source": "pliki",
+                    })
+                    st.success("✅ Analiza gotowa! Zobacz zakładki niżej.")
+                except Exception as exc:
+                    st.error(f"❌ Błąd analizy: {exc}")
+                    st.stop()
 
-# ── Wyniki (wspólne dla obu trybów) ──────────────────────────────────────────
+# ── Ekran startowy gdy brak danych ────────────────────────────────────────────
 if "analiza" not in st.session_state:
+    st.info(
+        "👋 **Zacznij od wczytania danych** — rozwiń panel **⚙️ Źródło danych** powyżej, "
+        "wybierz tryb (iBiznes lub pliki) i kliknij *Analizuj*. "
+        "Wyniki i agent AI pojawią się tutaj w zakładkach."
+    )
     st.stop()
 
+# ── Dane z sesji (wspólne dla zakładek) ───────────────────────────────────────
 analiza = st.session_state["analiza"]
 zam_df  = st.session_state["zam_df"]
 summary = st.session_state["summary"]
 context = st.session_state["context"]
 source  = st.session_state.get("data_source", "pliki")
 
-source_label = "⚡ iBiznes (live)" if source == "ibiznes" else "📁 Pliki"
-st.caption(f"Źródło danych: {source_label}")
-
-# ── Karty podsumowania ────────────────────────────────────────────────────────
-st.subheader("2. Podsumowanie dnia")
-st.caption(
-    f"Dane: {summary['data_od']} — {summary['data_do']} "
-    f"({summary['dni_okresu']} dni) | Wygenerowano: {summary['data_analizy']}"
-)
-
-m1, m2, m3, m4, m5, m6 = st.columns(6)
-with m1:
-    st.metric(
-        "💰 Magazyn (aktywne)",
-        fmt_pln(summary["wartosc_magazynu"]),
-        f"cały: {fmt_pln(summary.get('wartosc_calego_magazynu', summary['wartosc_magazynu']))}",
-        delta_color="off",
-    )
-with m2:
-    n_dostawcow = summary.get("dostawcow_z_otwartymi", 0)
-    delta_label = (
-        fmt_pln(summary.get("wartosc_w_drodze", 0))
-        + (f"  ({n_dostawcow} dostawców)" if n_dostawcow else "")
-    )
-    st.metric(
-        "🚚 W drodze",
-        f"{summary.get('produktow_w_drodze', 0)} poz.",
-        delta_label,
-        delta_color="off",
-    )
-with m3:
-    st.metric("🚨 Zamów DZIŚ",       f"{summary['produktow_dzis']} pozycji",
-              f"≈ {fmt_pln(summary['wartosc_dzis'])}", delta_color="inverse")
-with m4:
-    st.metric("🟡 Zamów w tygodniu", f"{summary['produktow_tydzien']} pozycji",
-              f"≈ {fmt_pln(summary['wartosc_tydzien'])}", delta_color="off")
-with m5:
-    st.metric("📦 Aktywnych prod.",   summary["produktow_aktywnych"],
-              f"z {summary['produktow_total']} w kartotece")
-with m6:
-    st.metric("⚫ Dead stock",        f"{summary['dead_stock_produktow']} prod.",
-              fmt_pln(summary["dead_stock_wartosc"]), delta_color="inverse")
-
-st.caption(
-    "ℹ️ **Zasady analizy:** Kartoteka jest filtrowana do produktów aktywnych (Akt='T' w iBiznes). "
-    "Rekomendacje 'Zamów' już uwzględniają to, co jest w drodze od dostawców — nie zamawiamy "
-    "podwójnie. Wartość 'magazynu (aktywne)' pomija dead stock."
-)
-
-st.divider()
-
-# ── Pobierz pliki Excel ───────────────────────────────────────────────────────
-st.subheader("3. Pobierz pliki Excel")
-
-today = datetime.now().strftime("%Y%m%d")
-dl1, dl2, dl3 = st.columns([2, 2, 3])
-
-with dl1:
-    try:
-        full_bytes = generate_full_excel(analiza, zam_df, summary)
-        st.download_button(
-            label="📥 Pełna analiza (Excel)",
-            data=full_bytes,
-            file_name=f"AddAll_analiza_{today}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary", use_container_width=True,
-        )
-    except Exception as e:
-        import traceback as _tb
-        st.error(f"Błąd pliku: {type(e).__name__}: {e}")
-        with st.expander("🔧 Pełny traceback (do diagnostyki)", expanded=False):
-            st.code(_tb.format_exc(), language="text")
-
-with dl2:
-    try:
-        order_bytes = generate_order_excel(analiza, summary)
-        st.download_button(
-            label="📥 Lista zamówień (prosta)",
-            data=order_bytes,
-            file_name=f"AddAll_zamowienia_{today}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
-    except Exception as e:
-        import traceback as _tb
-        st.error(f"Błąd pliku: {type(e).__name__}: {e}")
-        with st.expander("🔧 Pełny traceback", expanded=False):
-            st.code(_tb.format_exc(), language="text")
-
-with dl3:
-    st.info(
-        "**Pełna analiza** — m.in. ZAMÓW DZIŚ, Zamów tydzień, "
-        "nagłówek zamówień (w drodze), **Otwarte u dostawcy**, Top movers, Dead stock.\n\n"
-        "**Lista zamówień** — uproszczony plik; kolumna „Otwarte u dostawcy” pokazuje dokumenty, "
-        "do których można dorzucić pozycje."
-    )
-
-st.divider()
-
-# ── Tabele wyników ────────────────────────────────────────────────────────────
-st.subheader("4. Wyniki analizy")
-
-tab_dzis, tab_tydz, tab_droga, tab_otwarte, tab_top, tab_dead = st.tabs([
-    "🚨 Zamów DZIŚ", "🟡 Zamów w tygodniu",
-    "🔵 Nagłówek zamówień", "🏭 Otwarte u dostawców",
-    "📈 Top movers", "⚫ Dead stock",
-])
-
+# Kolumny i helpery używane w kilku zakładkach
 nazwa_col = find_col(analiza, "nazwa towaru")
 kod_col   = find_col(analiza, "kod towaru / usługi", "kod towaru")
 dos_col   = find_col(analiza, "dostawca")
@@ -681,8 +577,6 @@ def show_table(df, cols, extra_rename=None):
     st.dataframe(df[avail].rename(columns=rename), use_container_width=True, hide_index=True)
 
 
-# Mapowanie dostawca → otwarte zamówienia (z summary)
-# Klucze są w UPPER, więc lookup robimy str(dostawca).strip().upper()
 supplier_open = summary.get("supplier_open_orders", {}) or {}
 
 
@@ -708,196 +602,442 @@ def render_open_orders_banner(dostawca_name: str) -> None:
     )
 
 
-with tab_dzis:
-    dzis = analiza[analiza["status"] == "ZAMÓW DZIŚ"].sort_values("dni_do_wyczerpania")
-    if len(dzis) == 0:
-        st.success("🎉 Brak produktów do pilnego zamówienia!")
-        if supplier_open:
-            st.info(
-                f"Nadal masz **{len(supplier_open)}** dostawców z **otwartymi dokumentami** "
-                f"(jak w iBiznes „W realizacji”) — zobacz zakładkę **🏭 Otwarte u dostawców**."
-            )
-    else:
-        st.error(
-            f"**{len(dzis)} produktów wymaga zamówienia DZIŚ** "
-            f"— łącznie {fmt_pln(dzis['wartosc_zamowienia'].sum())}"
-        )
-        if dos_col:
-            for dostawca, grupa in dzis.groupby(dos_col):
-                razem  = grupa["wartosc_zamowienia"].sum()
-                min_v  = match_minimum(summary.get("min_log", {}), dostawca)
-                status = (
-                    f"⚠️ brakuje {fmt_pln(min_v - razem)} do minimum"
-                    if min_v > 0 and razem < min_v
-                    else ("✅ minimum OK" if min_v > 0 else "")
-                )
-                # Dodaj badge "ma otwarte zamówienia"
-                supplier_info = lookup_supplier_open_orders(supplier_open, dostawca)
-                open_badge = (
-                    f"  |  🚚 {supplier_info['liczba_dokumentow']} otwart."
-                    if supplier_info else ""
-                )
-                label = f"🏭 {dostawca} — {fmt_pln(razem)}{open_badge}"
-                if status:
-                    label += f"  |  {status}"
-                with st.expander(label, expanded=True):
-                    render_open_orders_banner(dostawca)
-                    show_table(grupa, display_cols)
-        else:
-            show_table(dzis, display_cols)
-
-with tab_tydz:
-    tydzien = analiza[analiza["status"] == "ZAMÓW TYDZIEŃ"].sort_values("dni_do_wyczerpania")
-    if len(tydzien) == 0:
-        st.success("Brak produktów do zamówienia w tym tygodniu.")
-    else:
-        st.warning(
-            f"**{len(tydzien)} produktów** — zamów do końca tygodnia "
-            f"— {fmt_pln(tydzien['wartosc_zamowienia'].sum())}"
-        )
-        if dos_col:
-            for dostawca, grupa in tydzien.groupby(dos_col):
-                supplier_info = lookup_supplier_open_orders(supplier_open, dostawca)
-                open_badge = (
-                    f"  |  🚚 {supplier_info['liczba_dokumentow']} otwart."
-                    if supplier_info else ""
-                )
-                with st.expander(
-                    f"🏭 {dostawca} — {fmt_pln(grupa['wartosc_zamowienia'].sum())}{open_badge}",
-                    expanded=False,
-                ):
-                    render_open_orders_banner(dostawca)
-                    show_table(grupa, display_cols)
-        else:
-            show_table(tydzien, display_cols)
-
-with tab_droga:
-    if zam_df is None or len(zam_df) == 0:
-        info = (
-            "Dane pobrane z iBiznes — nie znaleziono otwartych zamówień."
-            if source == "ibiznes"
-            else "Nie wgrano pliku z zamówieniami lub plik jest pusty."
-        )
-        st.info(info)
-    else:
-        clean = zam_df.drop(columns=["_data_realiz"], errors="ignore")
-        st.dataframe(clean, use_container_width=True, hide_index=True)
-
-with tab_otwarte:
-    st.markdown(
-        "**Otwarte zamówienia do dostawców** — zestawienie per firma: numery dokumentów (np. ZAZ/…), "
-        "wartości i **SKU już w drodze**. To odpowiada widokowi z iBiznes; tu dodatkowo widać, "
-        "do którego dokumentu można **dorzucić** kolejne pozycje."
-    )
-    if supplier_open:
-        rows = []
-        for _key, info in sorted(
-            supplier_open.items(),
-            key=lambda kv: (-(kv[1].get("laczna_wartosc") or 0), kv[1].get("nazwa", "")),
-        ):
-            naj = info.get("najblizsza_data") or ""
-            doc_list = info.get("orders") or []
-            n_docs = len(doc_list)
-            docs_short = ", ".join(o["nr"] for o in doc_list[:12])
-            if n_docs > 12:
-                docs_short += f" (+{n_docs - 12} więcej)"
-            kody = info.get("kody_w_drodze") or []
-            sku_n = len(kody) if isinstance(kody, list) else len(set(kody))
-            rows.append({
-                "Dostawca": info.get("nazwa", _key),
-                "Otwartych dokumentów": info.get("liczba_dokumentow", n_docs),
-                "Łączna wartość PLN": round(info.get("laczna_wartosc") or 0, 2),
-                "Najbliższa dostawa": naj,
-                "Numery dokumentów": docs_short,
-                "Unikalnych SKU w drodze": sku_n,
-            })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        st.caption(
-            f"Łącznie **{len(supplier_open)}** dostawców z aktywnymi zamówieniami. "
-            "Szczegóły pozycji (SKU) są w eksporterze Excel → arkusz „🏭 Otwarte u dostawcy”."
-        )
-    elif zam_df is not None and len(zam_df) > 0:
-        st.warning(
-            "Rozszerzone zestawienie (łączenie z kartoteką) jest niedostępne — pokazuję surowy "
-            "eksport nagłówka zamówień. Uruchom ponownie analizę z iBiznes lub z pliku zamówień."
-        )
-        clean = zam_df.drop(columns=["_data_realiz"], errors="ignore")
-        st.dataframe(clean, use_container_width=True, hide_index=True)
-    else:
-        st.info(
-            "Brak danych o otwartych zamówieniach. "
-            + (
-                "Sprawdź połączenie z bazą i czy w iBiznes są dokumenty „w realizacji”."
-                if source == "ibiznes"
-                else "W trybie plików **wgraj** `ZamówieniaDlaDostawcy.csv` z eksportu iBiznes."
-            )
-        )
-
-with tab_top:
-    top = analiza[analiza["srednie_dzienne"] > 0].nlargest(20, "srednie_dzienne")
-    top_cols = [c for c in [
-        kod_col, nazwa_col, dos_col,
-        "srednie_dzienne", "Stan", "dni_do_wyczerpania", "marza_pct",
-    ] if c and c in analiza.columns]
-    show_table(top, top_cols, {"marza_pct": "Marża %"})
-
-with tab_dead:
-    dead = analiza[analiza["status"] == "DEAD STOCK"].sort_values("wartosc_stanu", ascending=False)
-    if len(dead) == 0:
-        st.success("🎉 Brak dead stocku!")
-    else:
-        st.warning(
-            f"**{len(dead)} produktów** — zamrożony kapitał: "
-            f"{fmt_pln(dead['wartosc_stanu'].sum())}"
-        )
-        dead_cols = [c for c in [
-            kod_col, nazwa_col, dos_col,
-            "Stan", "wartosc_stanu", "ostatnia_sprzedaz",
-        ] if c and c in analiza.columns]
-        show_table(dead, dead_cols, {"wartosc_stanu": "Wartość stanu PLN"})
-
-st.divider()
-
-# ── Agent AI ──────────────────────────────────────────────────────────────────
-st.subheader("5. Agent AI — pełnoprawny asystent zakupowy")
-st.caption(
-    "Agent sam wywołuje narzędzia żeby odpowiedzieć na pytanie. "
-    "Pamięta Twoje preferencje między sesjami. Może filtrować, sortować, "
-    "porównywać dostawców i zapamiętywać Twoje nawyki."
+# Pamięć (potrzebna w zakładkach Agent i Pamięć)
+mem = get_memory()
+_exc_mem = mem.get("exclusions", {}) or {}
+mem_count = (
+    len(mem.get("preferences", {}))
+    + len(mem.get("facts", []))
+    + len(_exc_mem.get("products", []))
+    + len(_exc_mem.get("suppliers", []))
 )
 
-# Klucze obu providerów — wybór klucza zależy od wybranego modelu (niżej).
 anthropic_key = get_secret("ANTHROPIC_API_KEY")
 openai_key = get_secret("OPENAI_API_KEY")
 has_any_key = bool(anthropic_key or openai_key)
 
-from ai_agent import (
-    ask_agent,
-    get_memory,
-    save_preference,
-    remove_preference,
-    add_fact,
-    remove_fact,
-    get_exclusions,
-    add_exclusion,
-    remove_exclusion,
+source_label = "⚡ iBiznes (live)" if source == "ibiznes" else "📁 Pliki"
+st.caption(
+    f"Źródło: {source_label}  •  Dane: {summary['data_od']} — {summary['data_do']} "
+    f"({summary['dni_okresu']} dni)  •  Wygenerowano: {summary['data_analizy']}"
 )
 
-# ── Panel pamięci agenta ──────────────────────────────────────────────────────
-mem = get_memory()
-_exc = mem.get("exclusions", {}) or {}
-mem_count = (
-    len(mem.get("preferences", {}))
-    + len(mem.get("facts", []))
-    + len(_exc.get("products", []))
-    + len(_exc.get("suppliers", []))
-)
-with st.expander(
-    f"🧠 Pamięć agenta — preferencje i nawyki Anity ({mem_count} zapisanych)",
-    expanded=False,
-):
+# ── Diagnostyka minimów (jeśli są nietrafione) ────────────────────────────────
+_unmatched = (summary.get("min_log_unmatched") or []) if isinstance(summary, dict) else []
+if _unmatched:
+    st.warning(
+        "📏 Minima logistyczne bez dopasowanego dostawcy w analizie "
+        f"(sprawdź pisownię/alias): {', '.join(_unmatched)}"
+    )
+
+# ═══════════════════════════════════════════════════════════════════
+# GŁÓWNE ZAKŁADKI
+# ═══════════════════════════════════════════════════════════════════
+tab_over, tab_res, tab_agent, tab_mem, tab_exp = st.tabs([
+    "📊 Przegląd", "📋 Wyniki", "🤖 Agent AI", "🧠 Pamięć", "⬇️ Eksport",
+])
+
+# ── ZAKŁADKA: Przegląd ────────────────────────────────────────────────────────
+with tab_over:
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    with m1:
+        st.metric(
+            "💰 Magazyn (aktywne)",
+            fmt_pln(summary["wartosc_magazynu"]),
+            f"cały: {fmt_pln(summary.get('wartosc_calego_magazynu', summary['wartosc_magazynu']))}",
+            delta_color="off",
+        )
+    with m2:
+        n_dostawcow = summary.get("dostawcow_z_otwartymi", 0)
+        delta_label = (
+            fmt_pln(summary.get("wartosc_w_drodze", 0))
+            + (f"  ({n_dostawcow} dostawców)" if n_dostawcow else "")
+        )
+        st.metric(
+            "🚚 W drodze",
+            f"{summary.get('produktow_w_drodze', 0)} poz.",
+            delta_label,
+            delta_color="off",
+        )
+    with m3:
+        st.metric("🚨 Zamów DZIŚ",       f"{summary['produktow_dzis']} pozycji",
+                  f"≈ {fmt_pln(summary['wartosc_dzis'])}", delta_color="inverse")
+    with m4:
+        st.metric("🟡 Zamów w tygodniu", f"{summary['produktow_tydzien']} pozycji",
+                  f"≈ {fmt_pln(summary['wartosc_tydzien'])}", delta_color="off")
+    with m5:
+        st.metric("📦 Aktywnych prod.",   summary["produktow_aktywnych"],
+                  f"z {summary['produktow_total']} w kartotece")
+    with m6:
+        st.metric("⚫ Dead stock",        f"{summary['dead_stock_produktow']} prod.",
+                  fmt_pln(summary["dead_stock_wartosc"]), delta_color="inverse")
+
+    st.caption(
+        "ℹ️ **Zasady analizy:** Kartoteka jest filtrowana do produktów aktywnych (Akt='T' w iBiznes). "
+        "Rekomendacje 'Zamów' już uwzględniają to, co jest w drodze od dostawców — nie zamawiamy "
+        "podwójnie. Wartość 'magazynu (aktywne)' pomija dead stock."
+    )
+
+# ── ZAKŁADKA: Wyniki ──────────────────────────────────────────────────────────
+with tab_res:
+    sub_dzis, sub_tydz, sub_droga, sub_otwarte, sub_top, sub_dead = st.tabs([
+        "🚨 Zamów DZIŚ", "🟡 Zamów w tygodniu",
+        "🔵 Nagłówek zamówień", "🏭 Otwarte u dostawców",
+        "📈 Top movers", "⚫ Dead stock",
+    ])
+
+    with sub_dzis:
+        dzis = analiza[analiza["status"] == "ZAMÓW DZIŚ"].sort_values("dni_do_wyczerpania")
+        if len(dzis) == 0:
+            st.success("🎉 Brak produktów do pilnego zamówienia!")
+            if supplier_open:
+                st.info(
+                    f"Nadal masz **{len(supplier_open)}** dostawców z **otwartymi dokumentami** "
+                    f"(jak w iBiznes „W realizacji”) — zobacz zakładkę **🏭 Otwarte u dostawców**."
+                )
+        else:
+            st.error(
+                f"**{len(dzis)} produktów wymaga zamówienia DZIŚ** "
+                f"— łącznie {fmt_pln(dzis['wartosc_zamowienia'].sum())}"
+            )
+            if dos_col:
+                for dostawca, grupa in dzis.groupby(dos_col):
+                    razem  = grupa["wartosc_zamowienia"].sum()
+                    min_v  = match_minimum(summary.get("min_log", {}), dostawca)
+                    status = (
+                        f"⚠️ brakuje {fmt_pln(min_v - razem)} do minimum"
+                        if min_v > 0 and razem < min_v
+                        else ("✅ minimum OK" if min_v > 0 else "")
+                    )
+                    supplier_info = lookup_supplier_open_orders(supplier_open, dostawca)
+                    open_badge = (
+                        f"  |  🚚 {supplier_info['liczba_dokumentow']} otwart."
+                        if supplier_info else ""
+                    )
+                    label = f"🏭 {dostawca} — {fmt_pln(razem)}{open_badge}"
+                    if status:
+                        label += f"  |  {status}"
+                    with st.expander(label, expanded=True):
+                        render_open_orders_banner(dostawca)
+                        show_table(grupa, display_cols)
+            else:
+                show_table(dzis, display_cols)
+
+    with sub_tydz:
+        tydzien = analiza[analiza["status"] == "ZAMÓW TYDZIEŃ"].sort_values("dni_do_wyczerpania")
+        if len(tydzien) == 0:
+            st.success("Brak produktów do zamówienia w tym tygodniu.")
+        else:
+            st.warning(
+                f"**{len(tydzien)} produktów** — zamów do końca tygodnia "
+                f"— {fmt_pln(tydzien['wartosc_zamowienia'].sum())}"
+            )
+            if dos_col:
+                for dostawca, grupa in tydzien.groupby(dos_col):
+                    supplier_info = lookup_supplier_open_orders(supplier_open, dostawca)
+                    open_badge = (
+                        f"  |  🚚 {supplier_info['liczba_dokumentow']} otwart."
+                        if supplier_info else ""
+                    )
+                    with st.expander(
+                        f"🏭 {dostawca} — {fmt_pln(grupa['wartosc_zamowienia'].sum())}{open_badge}",
+                        expanded=False,
+                    ):
+                        render_open_orders_banner(dostawca)
+                        show_table(grupa, display_cols)
+            else:
+                show_table(tydzien, display_cols)
+
+    with sub_droga:
+        if zam_df is None or len(zam_df) == 0:
+            info = (
+                "Dane pobrane z iBiznes — nie znaleziono otwartych zamówień."
+                if source == "ibiznes"
+                else "Nie wgrano pliku z zamówieniami lub plik jest pusty."
+            )
+            st.info(info)
+        else:
+            clean = zam_df.drop(columns=["_data_realiz"], errors="ignore")
+            st.dataframe(clean, use_container_width=True, hide_index=True)
+
+    with sub_otwarte:
+        st.markdown(
+            "**Otwarte zamówienia do dostawców** — zestawienie per firma: numery dokumentów (np. ZAZ/…), "
+            "wartości i **SKU już w drodze**. To odpowiada widokowi z iBiznes; tu dodatkowo widać, "
+            "do którego dokumentu można **dorzucić** kolejne pozycje."
+        )
+        if supplier_open:
+            rows = []
+            for _key, info in sorted(
+                supplier_open.items(),
+                key=lambda kv: (-(kv[1].get("laczna_wartosc") or 0), kv[1].get("nazwa", "")),
+            ):
+                naj = info.get("najblizsza_data") or ""
+                doc_list = info.get("orders") or []
+                n_docs = len(doc_list)
+                docs_short = ", ".join(o["nr"] for o in doc_list[:12])
+                if n_docs > 12:
+                    docs_short += f" (+{n_docs - 12} więcej)"
+                kody = info.get("kody_w_drodze") or []
+                sku_n = len(kody) if isinstance(kody, list) else len(set(kody))
+                rows.append({
+                    "Dostawca": info.get("nazwa", _key),
+                    "Otwartych dokumentów": info.get("liczba_dokumentow", n_docs),
+                    "Łączna wartość PLN": round(info.get("laczna_wartosc") or 0, 2),
+                    "Najbliższa dostawa": naj,
+                    "Numery dokumentów": docs_short,
+                    "Unikalnych SKU w drodze": sku_n,
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.caption(
+                f"Łącznie **{len(supplier_open)}** dostawców z aktywnymi zamówieniami. "
+                "Szczegóły pozycji (SKU) są w eksporterze Excel → arkusz „🏭 Otwarte u dostawcy”."
+            )
+        elif zam_df is not None and len(zam_df) > 0:
+            st.warning(
+                "Rozszerzone zestawienie (łączenie z kartoteką) jest niedostępne — pokazuję surowy "
+                "eksport nagłówka zamówień. Uruchom ponownie analizę z iBiznes lub z pliku zamówień."
+            )
+            clean = zam_df.drop(columns=["_data_realiz"], errors="ignore")
+            st.dataframe(clean, use_container_width=True, hide_index=True)
+        else:
+            st.info(
+                "Brak danych o otwartych zamówieniach. "
+                + (
+                    "Sprawdź połączenie z bazą i czy w iBiznes są dokumenty „w realizacji”."
+                    if source == "ibiznes"
+                    else "W trybie plików **wgraj** `ZamówieniaDlaDostawcy.csv` z eksportu iBiznes."
+                )
+            )
+
+    with sub_top:
+        top = analiza[analiza["srednie_dzienne"] > 0].nlargest(20, "srednie_dzienne")
+        top_cols = [c for c in [
+            kod_col, nazwa_col, dos_col,
+            "srednie_dzienne", "Stan", "dni_do_wyczerpania", "marza_pct",
+        ] if c and c in analiza.columns]
+        show_table(top, top_cols, {"marza_pct": "Marża %"})
+
+    with sub_dead:
+        dead = analiza[analiza["status"] == "DEAD STOCK"].sort_values("wartosc_stanu", ascending=False)
+        if len(dead) == 0:
+            st.success("🎉 Brak dead stocku!")
+        else:
+            st.warning(
+                f"**{len(dead)} produktów** — zamrożony kapitał: "
+                f"{fmt_pln(dead['wartosc_stanu'].sum())}"
+            )
+            dead_cols = [c for c in [
+                kod_col, nazwa_col, dos_col,
+                "Stan", "wartosc_stanu", "ostatnia_sprzedaz",
+            ] if c and c in analiza.columns]
+            show_table(dead, dead_cols, {"wartosc_stanu": "Wartość stanu PLN"})
+
+# ── ZAKŁADKA: Agent AI ────────────────────────────────────────────────────────
+with tab_agent:
+    st.caption(
+        "Agent sam wywołuje narzędzia żeby odpowiedzieć na pytanie. Pamięta Twoje preferencje "
+        "i wykluczenia między sesjami, egzekwuje minima logistyczne i podpowiada dozamówienia."
+    )
+
+    if not has_any_key:
+        st.info(
+            "Dodaj klucz API żeby włączyć agenta: `ANTHROPIC_API_KEY` (Claude, zalecane) "
+            "lub `OPENAI_API_KEY` (zapas) w Railway → Variables."
+        )
+    else:
+        if "chat_history" not in st.session_state:
+            st.session_state["chat_history"] = []
+
+        # Wybór modelu — domyślnie Claude Sonnet 4.6 (lepszy od OpenAI), GPT jako zapas.
+        col_m1, col_m2 = st.columns([3, 4])
+        with col_m1:
+            model_choice = st.selectbox(
+                "🤖 Model AI:",
+                options=[
+                    "claude-sonnet-4-6",
+                    "gpt-4.1",
+                    "gpt-4o",
+                    "gpt-5",
+                    "(własny — wpisz obok)",
+                ],
+                index=0,
+                help=(
+                    "claude-sonnet-4-6 — zalecany, najlepszy (klucz ANTHROPIC_API_KEY).\n"
+                    "gpt-4.1 / gpt-5 / gpt-4o — zapas OpenAI (klucz OPENAI_API_KEY).\n"
+                    "Przy błędzie Claude następuje automatyczny fallback na gpt-4o."
+                ),
+            )
+        with col_m2:
+            custom_model = st.text_input(
+                "Własna nazwa modelu:",
+                value="" if model_choice != "(własny — wpisz obok)" else "claude-sonnet-4-6",
+                disabled=(model_choice != "(własny — wpisz obok)"),
+                placeholder="np. claude-opus-4-8, gpt-4.1-mini, o1",
+            )
+
+        actual_model = custom_model.strip() if model_choice == "(własny — wpisz obok)" and custom_model.strip() else model_choice
+
+        # Klucz API zależnie od wybranego providera
+        needs_claude = str(actual_model).lower().startswith("claude")
+        api_key = anthropic_key if needs_claude else openai_key
+        if not api_key:
+            api_key = st.text_input(
+                f"🔑 Klucz API {'Anthropic' if needs_claude else 'OpenAI'}:",
+                type="password",
+                placeholder="sk-ant-..." if needs_claude else "sk-...",
+                help=(
+                    f"Zapisz jako {'ANTHROPIC_API_KEY' if needs_claude else 'OPENAI_API_KEY'} "
+                    "w Railway → Variables"
+                ),
+                key="model_api_key",
+            )
+
+        # Dodatkowe instrukcje (sticky system addon)
+        extra_instr = st.text_area(
+            "📌 Dodatkowe instrukcje dla agenta (opcjonalne, pamiętane w sesji):",
+            value=st.session_state.get("extra_instr", ""),
+            height=70,
+            placeholder=(
+                "Np. 'Zawsze podaj sumę zamówienia per dostawca.' albo "
+                "'Jeśli marża < 15%, dodaj ostrzeżenie.'"
+            ),
+            key="extra_instr",
+        )
+
+        # Historia czatu
+        for msg in st.session_state["chat_history"]:
+            with st.chat_message(msg["role"]):
+                st.write(msg["content"])
+                if msg.get("tool_log"):
+                    with st.expander(f"🔧 Narzędzia użyte ({len(msg['tool_log'])} wywołań)", expanded=False):
+                        for t in msg["tool_log"]:
+                            st.caption(
+                                f"**{t['name']}** (iter {t['iteration']}) "
+                                f"args: `{t['args']}`"
+                            )
+                            st.code(t["result_preview"], language="json")
+
+        # Szybkie pytania
+        st.markdown("**🎯 Szybkie pytania:**")
+        qcols = st.columns(4)
+        quick_qs = [
+            "☀️ Odprawa poranna: co zamówić DZIŚ i DLACZEGO? Pogrupuj per dostawca, "
+            "przy każdej pozycji podaj ile szt, za ile PLN i powód (zapas/tempo). "
+            "Jeśli u dostawcy mam już otwarte zamówienie — powiedz że mogę dorzucić.",
+            "Pokaż top 5 dostawców wg wartości zamówień.",
+            "Produkty z marżą poniżej 20% — top 10 wg sprzedaży.",
+            "Co jest już zamówione i w drodze? Podaj per dostawca i łączną kwotę.",
+        ]
+        for i, (qcol, q) in enumerate(zip(qcols, quick_qs)):
+            with qcol:
+                if st.button(q, key=f"quick_{i}", use_container_width=True):
+                    st.session_state["_pending_q"] = q
+                    st.rerun()
+
+        # Główne okno do promptowania (większe, wieloliniowe)
+        st.markdown("**💬 Twoje pytanie do agenta:**")
+
+        with st.form(key="agent_form", clear_on_submit=True):
+            pending_q = st.session_state.pop("_pending_q", "")
+            user_input = st.text_area(
+                "Pytanie:",
+                value=pending_q,
+                height=130,
+                placeholder=(
+                    "Napisz cokolwiek — agent sam pociągnie odpowiednie dane:\n"
+                    "• 'Sprawdź dostawcę BIACHEM i powiedz co warto zamówić.'\n"
+                    "• 'Zapamiętaj że minimum logistyczne ADEKS to 3000 PLN.'\n"
+                    "• 'Top 15 produktów z najmniejszym zapasem dni — koniecznie z dostawcą.'"
+                ),
+                label_visibility="collapsed",
+            )
+            col_b1, col_b2 = st.columns([1, 5])
+            with col_b1:
+                submitted = st.form_submit_button("▶ Zapytaj", type="primary", use_container_width=True)
+            with col_b2:
+                st.caption(f"Model: **{actual_model}** | Pamięć: **{mem_count}** zapisów")
+
+        if submitted and not api_key:
+            st.warning(
+                f"Brak klucza API dla modelu `{actual_model}` — wpisz go wyżej "
+                f"({'ANTHROPIC_API_KEY' if needs_claude else 'OPENAI_API_KEY'})."
+            )
+        elif submitted and user_input.strip():
+            question = user_input.strip()
+            st.session_state["chat_history"].append({"role": "user", "content": question})
+
+            with st.chat_message("user"):
+                st.write(question)
+
+            with st.chat_message("assistant"):
+                with st.spinner(f"🤖 Agent pracuje (model: {actual_model})…"):
+                    answer, tool_log, err = ask_agent(
+                        question=question,
+                        analiza=analiza,
+                        summary=summary,
+                        context=context,
+                        api_key=api_key,
+                        model=actual_model,
+                        chat_history=st.session_state["chat_history"][:-1],
+                        extra_system_instructions=extra_instr.strip() or None,
+                    )
+
+                    # Fallback (zapas): gdy wybrany model padł, a jest klucz OpenAI → gpt-4o
+                    if err and actual_model != "gpt-4o" and openai_key:
+                        st.caption(f"⚠️ Model `{actual_model}` zwrócił błąd — próbuję `gpt-4o` (zapas)…")
+                        answer, tool_log, err = ask_agent(
+                            question=question,
+                            analiza=analiza,
+                            summary=summary,
+                            context=context,
+                            api_key=openai_key,
+                            model="gpt-4o",
+                            chat_history=st.session_state["chat_history"][:-1],
+                            extra_system_instructions=extra_instr.strip() or None,
+                        )
+
+                    if err:
+                        st.error(
+                            f"❌ Błąd agenta: {err}\n\n"
+                            "Najczęstsze przyczyny:\n"
+                            "- nieprawidłowy klucz API (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`)\n"
+                            "- brak środków / limit (billing, rate limit)\n"
+                            "- model niedostępny w Twoim koncie\n"
+                            "- brak biblioteki `anthropic` (Claude) — sprawdź requirements"
+                        )
+                    else:
+                        st.write(answer)
+                        if tool_log:
+                            with st.expander(
+                                f"🔧 Narzędzia użyte przez agenta ({len(tool_log)})",
+                                expanded=False,
+                            ):
+                                for t in tool_log:
+                                    st.caption(
+                                        f"**{t['name']}** (iter {t['iteration']}) "
+                                        f"args: `{t['args']}`"
+                                    )
+                                    st.code(t["result_preview"], language="json")
+                        st.session_state["chat_history"].append({
+                            "role": "assistant",
+                            "content": answer,
+                            "tool_log": tool_log,
+                        })
+
+        if st.session_state.get("chat_history"):
+            if st.button("🗑 Wyczyść chat (pamięć Anity zostaje)", key="clear_chat"):
+                st.session_state["chat_history"] = []
+                st.rerun()
+
+# ── ZAKŁADKA: Pamięć ──────────────────────────────────────────────────────────
+with tab_mem:
+    st.caption(
+        f"Agent uczy się na Anicie — {mem_count} zapisanych preferencji, faktów i wykluczeń. "
+        "Pamięć przeżywa sesje (plik `data/anita_memory.json`)."
+    )
+
     col_pref, col_facts = st.columns(2)
-
     with col_pref:
         st.markdown("**Preferencje (klucz=wartość):**")
         prefs = mem.get("preferences", {})
@@ -918,7 +1058,7 @@ with st.expander(
                 st.rerun()
 
     with col_facts:
-        st.markdown("**Fakty / nawyki:**")
+        st.markdown("**Fakty / nawyki / reguły:**")
         facts = mem.get("facts", [])
         if not facts:
             st.caption("_Pusto — agent dodaje fakty automatycznie z rozmowy._")
@@ -975,223 +1115,69 @@ with st.expander(
                 st.rerun()
 
     if mem.get("history"):
+        st.divider()
         st.markdown("**Ostatnie pytania (historia):**")
         for h in reversed(mem["history"][-10:]):
             st.caption(f"📅 {h.get('date', '')[:16]} → {h.get('question', '')[:120]}")
 
-# Diagnostyka kontekstu
-with st.expander("🔧 Podgląd statycznego kontekstu wysyłanego do AI", expanded=False):
-    st.caption(
-        f"Długość: **{len(context):,} znaków** | "
-        f"Linii: **{context.count(chr(10)) + 1}** | "
-        "Agent ma też dostęp do narzędzi (query_products, get_dostawca_summary itp.) "
-        "więc kontekst to tylko snapshot — szczegóły bierze przez tool use."
-    )
-    st.code(context[:5000] + ("\n...[ucięte]" if len(context) > 5000 else ""), language="text")
+    with st.expander("🔧 Podgląd statycznego kontekstu wysyłanego do AI", expanded=False):
+        st.caption(
+            f"Długość: **{len(context):,} znaków** | "
+            f"Linii: **{context.count(chr(10)) + 1}** | "
+            "Agent ma też dostęp do narzędzi (query_products, get_dostawca_summary itp.) "
+            "więc kontekst to tylko snapshot — szczegóły bierze przez tool use."
+        )
+        st.code(context[:5000] + ("\n...[ucięte]" if len(context) > 5000 else ""), language="text")
 
-# Diagnostyka minimów logistycznych (nazwy z tabeli bez dopasowanego dostawcy)
-_unmatched = (summary.get("min_log_unmatched") or []) if isinstance(summary, dict) else []
-if _unmatched:
-    st.warning(
-        "📏 Minima logistyczne bez dopasowanego dostawcy w analizie "
-        f"(sprawdź pisownię/alias): {', '.join(_unmatched)}"
-    )
+# ── ZAKŁADKA: Eksport ─────────────────────────────────────────────────────────
+with tab_exp:
+    st.markdown("**Pobierz wyniki jako pliki Excel.**")
+    today = datetime.now().strftime("%Y%m%d")
+    dl1, dl2 = st.columns(2)
 
-if not has_any_key:
+    with dl1:
+        try:
+            full_bytes = generate_full_excel(analiza, zam_df, summary)
+            st.download_button(
+                label="📥 Pełna analiza (Excel)",
+                data=full_bytes,
+                file_name=f"AddAll_analiza_{today}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary", use_container_width=True,
+            )
+        except Exception as e:
+            import traceback as _tb
+            st.error(f"Błąd pliku: {type(e).__name__}: {e}")
+            with st.expander("🔧 Pełny traceback (do diagnostyki)", expanded=False):
+                st.code(_tb.format_exc(), language="text")
+
+    with dl2:
+        try:
+            order_bytes = generate_order_excel(analiza, summary)
+            st.download_button(
+                label="📥 Lista zamówień (prosta)",
+                data=order_bytes,
+                file_name=f"AddAll_zamowienia_{today}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        except Exception as e:
+            import traceback as _tb
+            st.error(f"Błąd pliku: {type(e).__name__}: {e}")
+            with st.expander("🔧 Pełny traceback", expanded=False):
+                st.code(_tb.format_exc(), language="text")
+
     st.info(
-        "Dodaj klucz API żeby włączyć agenta: `ANTHROPIC_API_KEY` (Claude, zalecane) "
-        "lub `OPENAI_API_KEY` (zapas) w Railway → Variables."
+        "**Pełna analiza** — m.in. ZAMÓW DZIŚ, Zamów tydzień, "
+        "nagłówek zamówień (w drodze), **Otwarte u dostawcy**, Top movers, Dead stock.\n\n"
+        "**Lista zamówień** — uproszczony plik; kolumna „Otwarte u dostawcy” pokazuje dokumenty, "
+        "do których można dorzucić pozycje."
     )
-else:
-    if "chat_history" not in st.session_state:
-        st.session_state["chat_history"] = []
-
-    # Wybór modelu — domyślnie Claude Sonnet 4.6 (lepszy od OpenAI), modele GPT
-    # jako zapas. Claude → klucz ANTHROPIC_API_KEY, GPT → OPENAI_API_KEY.
-    col_m1, col_m2 = st.columns([3, 4])
-    with col_m1:
-        model_choice = st.selectbox(
-            "🤖 Model AI:",
-            options=[
-                "claude-sonnet-4-6",
-                "gpt-4.1",
-                "gpt-4o",
-                "gpt-5",
-                "(własny — wpisz obok)",
-            ],
-            index=0,
-            help=(
-                "claude-sonnet-4-6 — zalecany, najlepszy (klucz ANTHROPIC_API_KEY).\n"
-                "gpt-4.1 / gpt-5 / gpt-4o — zapas OpenAI (klucz OPENAI_API_KEY).\n"
-                "Przy błędzie Claude następuje automatyczny fallback na gpt-4o."
-            ),
-        )
-    with col_m2:
-        custom_model = st.text_input(
-            "Własna nazwa modelu:",
-            value="" if model_choice != "(własny — wpisz obok)" else "claude-sonnet-4-6",
-            disabled=(model_choice != "(własny — wpisz obok)"),
-            placeholder="np. claude-opus-4-8, gpt-4.1-mini, o1",
-        )
-
-    actual_model = custom_model.strip() if model_choice == "(własny — wpisz obok)" and custom_model.strip() else model_choice
-
-    # Klucz API zależnie od wybranego providera
-    needs_claude = str(actual_model).lower().startswith("claude")
-    api_key = anthropic_key if needs_claude else openai_key
-    if not api_key:
-        api_key = st.text_input(
-            f"🔑 Klucz API {'Anthropic' if needs_claude else 'OpenAI'}:",
-            type="password",
-            placeholder="sk-ant-..." if needs_claude else "sk-...",
-            help=(
-                f"Zapisz jako {'ANTHROPIC_API_KEY' if needs_claude else 'OPENAI_API_KEY'} "
-                "w Railway → Variables"
-            ),
-            key="model_api_key",
-        )
-
-    # Dodatkowe instrukcje (sticky system addon)
-    extra_instr = st.text_area(
-        "📌 Dodatkowe instrukcje dla agenta (opcjonalne, pamiętane w sesji):",
-        value=st.session_state.get("extra_instr", ""),
-        height=70,
-        placeholder=(
-            "Np. 'Zawsze podaj sumę zamówienia per dostawca.' albo "
-            "'Jeśli marża < 15%, dodaj ostrzeżenie.'"
-        ),
-        key="extra_instr",
-    )
-
-    # Historia czatu
-    for msg in st.session_state["chat_history"]:
-        with st.chat_message(msg["role"]):
-            st.write(msg["content"])
-            if msg.get("tool_log"):
-                with st.expander(f"🔧 Narzędzia użyte ({len(msg['tool_log'])} wywołań)", expanded=False):
-                    for t in msg["tool_log"]:
-                        st.caption(
-                            f"**{t['name']}** (iter {t['iteration']}) "
-                            f"args: `{t['args']}`"
-                        )
-                        st.code(t["result_preview"], language="json")
-
-    # Szybkie pytania
-    st.markdown("**🎯 Szybkie pytania:**")
-    qcols = st.columns(4)
-    quick_qs = [
-        "☀️ Odprawa poranna: co zamówić DZIŚ i DLACZEGO? Pogrupuj per dostawca, "
-        "przy każdej pozycji podaj ile szt, za ile PLN i powód (zapas/tempo). "
-        "Jeśli u dostawcy mam już otwarte zamówienie — powiedz że mogę dorzucić.",
-        "Pokaż top 5 dostawców wg wartości zamówień.",
-        "Produkty z marżą poniżej 20% — top 10 wg sprzedaży.",
-        "Co jest już zamówione i w drodze? Podaj per dostawca i łączną kwotę.",
-    ]
-    for i, (qcol, q) in enumerate(zip(qcols, quick_qs)):
-        with qcol:
-            if st.button(q, key=f"quick_{i}", use_container_width=True):
-                st.session_state["_pending_q"] = q
-                st.rerun()
-
-    # Główne okno do promptowania (większe, wieloliniowe)
-    st.markdown("**💬 Twoje pytanie do agenta:**")
-
-    with st.form(key="agent_form", clear_on_submit=True):
-        pending_q = st.session_state.pop("_pending_q", "")
-        user_input = st.text_area(
-            "Pytanie:",
-            value=pending_q,
-            height=130,
-            placeholder=(
-                "Napisz cokolwiek — agent sam pociągnie odpowiednie dane:\n"
-                "• 'Sprawdź dostawcę BIACHEM i powiedz co warto zamówić.'\n"
-                "• 'Zapamiętaj że minimum logistyczne ADEKS to 3000 PLN.'\n"
-                "• 'Top 15 produktów z najmniejszym zapasem dni — koniecznie z dostawcą.'"
-            ),
-            label_visibility="collapsed",
-        )
-        col_b1, col_b2 = st.columns([1, 5])
-        with col_b1:
-            submitted = st.form_submit_button("▶ Zapytaj", type="primary", use_container_width=True)
-        with col_b2:
-            st.caption(f"Model: **{actual_model}** | Pamięć: **{mem_count}** zapisów")
-
-    if submitted and not api_key:
-        st.warning(
-            f"Brak klucza API dla modelu `{actual_model}` — wpisz go wyżej "
-            f"({'ANTHROPIC_API_KEY' if needs_claude else 'OPENAI_API_KEY'})."
-        )
-    elif submitted and user_input.strip():
-        question = user_input.strip()
-        st.session_state["chat_history"].append({"role": "user", "content": question})
-
-        with st.chat_message("user"):
-            st.write(question)
-
-        with st.chat_message("assistant"):
-            with st.spinner(f"🤖 Agent pracuje (model: {actual_model})…"):
-                answer, tool_log, err = ask_agent(
-                    question=question,
-                    analiza=analiza,
-                    summary=summary,
-                    context=context,
-                    api_key=api_key,
-                    model=actual_model,
-                    chat_history=st.session_state["chat_history"][:-1],
-                    extra_system_instructions=extra_instr.strip() or None,
-                )
-
-                # Fallback (zapas): gdy wybrany model padł, a jest klucz OpenAI → gpt-4o
-                if err and actual_model != "gpt-4o" and openai_key:
-                    st.caption(f"⚠️ Model `{actual_model}` zwrócił błąd — próbuję `gpt-4o` (zapas)…")
-                    answer, tool_log, err = ask_agent(
-                        question=question,
-                        analiza=analiza,
-                        summary=summary,
-                        context=context,
-                        api_key=openai_key,
-                        model="gpt-4o",
-                        chat_history=st.session_state["chat_history"][:-1],
-                        extra_system_instructions=extra_instr.strip() or None,
-                    )
-
-                if err:
-                    st.error(
-                        f"❌ Błąd agenta: {err}\n\n"
-                        "Najczęstsze przyczyny:\n"
-                        "- nieprawidłowy klucz API (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`)\n"
-                        "- brak środków / limit (billing, rate limit)\n"
-                        "- model niedostępny w Twoim koncie\n"
-                        "- brak biblioteki `anthropic` (Claude) — sprawdź requirements"
-                    )
-                else:
-                    st.write(answer)
-                    if tool_log:
-                        with st.expander(
-                            f"🔧 Narzędzia użyte przez agenta ({len(tool_log)})",
-                            expanded=False,
-                        ):
-                            for t in tool_log:
-                                st.caption(
-                                    f"**{t['name']}** (iter {t['iteration']}) "
-                                    f"args: `{t['args']}`"
-                                )
-                                st.code(t["result_preview"], language="json")
-                    st.session_state["chat_history"].append({
-                        "role": "assistant",
-                        "content": answer,
-                        "tool_log": tool_log,
-                    })
-
-    if st.session_state.get("chat_history"):
-        if st.button("🗑 Wyczyść chat (pamięć Anity zostaje)", key="clear_chat"):
-            st.session_state["chat_history"] = []
-            st.rerun()
 
 # ── Stopka ────────────────────────────────────────────────────────────────────
 st.divider()
 st.caption(
-    f"Add All Asystent Zakupowy v2.2 (poprawne mapowanie iBiznes + status zamówień po Typ) | "
+    f"Add All Asystent Zakupowy v2.3 (Claude Sonnet 4.6 + minima logistyczne + uczenie) | "
     f"Dane analizy nie są zapisywane, pamięć agenta = `data/anita_memory.json` "
     f"(dla persystencji między deployami dodaj Railway Volume na `/app/data`) | "
     f"{datetime.now().strftime('%Y')}"
