@@ -22,6 +22,8 @@ from ai_agent import (
     get_exclusions,
     add_exclusion,
     remove_exclusion,
+    export_memory_json,
+    import_memory,
 )
 
 # ── Konfiguracja strony ───────────────────────────────────────────────────────
@@ -1036,6 +1038,38 @@ with tab_mem:
         f"Agent uczy się na Anicie — {mem_count} zapisanych preferencji, faktów i wykluczeń. "
         "Pamięć przeżywa sesje (plik `data/anita_memory.json`)."
     )
+
+    # ── Kopia zapasowa / przywracanie pamięci ─────────────────────────────────
+    with st.expander("💾 Kopia zapasowa pamięci (pobierz / przywróć)", expanded=False):
+        bk1, bk2 = st.columns(2)
+        with bk1:
+            st.markdown("**Pobierz kopię** — zapisz plik u siebie, żeby nigdy nie stracić danych.")
+            st.download_button(
+                "⬇️ Pobierz kopię pamięci (JSON)",
+                data=export_memory_json().encode("utf-8"),
+                file_name=f"anita_memory_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+        with bk2:
+            st.markdown("**Przywróć z pliku** — wpisy z kopii zostaną **dołączone** (nic nie kasuje).")
+            restore_file = st.file_uploader(
+                "Przywróć pamięć z pliku JSON", type=["json"],
+                key="mem_restore", label_visibility="collapsed",
+            )
+            if restore_file is not None and st.button("⬆️ Przywróć (dołącz do obecnej)", use_container_width=True):
+                try:
+                    merged = import_memory(restore_file.getvalue(), merge=True)
+                    n = (
+                        len(merged.get("preferences", {}))
+                        + len(merged.get("facts", []))
+                        + len(merged.get("exclusions", {}).get("products", []))
+                        + len(merged.get("exclusions", {}).get("suppliers", []))
+                    )
+                    st.success(f"✅ Przywrócono. Łącznie {n} wpisów w pamięci.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Nie udało się wczytać pliku: {e}")
 
     col_pref, col_facts = st.columns(2)
     with col_pref:

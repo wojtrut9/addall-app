@@ -17,8 +17,10 @@ Trzy kluczowe rzeczy odróżniające go od zwykłego chatbota:
 """
 from __future__ import annotations
 
+import html as _html
 import json
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -29,23 +31,91 @@ from engine import lookup_supplier_open_orders, match_minimum
 # ── Pamięć Anity ──────────────────────────────────────────────────────────────
 
 MEMORY_FILE = Path(os.environ.get("ANITA_MEMORY_PATH", "data/anita_memory.json"))
+MEMORY_BAK = Path(str(MEMORY_FILE) + ".bak")  # kopia ostatniej dobrej wersji
 MAX_HISTORY = 50
 
 
+def _default_memory() -> dict:
+    return {"preferences": {}, "facts": [], "history": [], "exclusions": {"products": [], "suppliers": []}}
+
+
 def _load_memory() -> dict:
-    if not MEMORY_FILE.exists():
-        return {"preferences": {}, "facts": [], "history": [], "exclusions": {"products": [], "suppliers": []}}
-    try:
-        return json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {"preferences": {}, "facts": [], "history": [], "exclusions": {"products": [], "suppliers": []}}
+    """Czyta pamięć; przy uszkodzeniu głównego pliku próbuje kopii .bak."""
+    for p in (MEMORY_FILE, MEMORY_BAK):
+        try:
+            if p.exists():
+                data = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            continue
+    return _default_memory()
 
 
 def _save_memory(memory: dict) -> None:
+    """Zapis ODPORNY na utratę danych:
+    1) kopiuje obecny plik do .bak (poprzednia dobra wersja),
+    2) zapis atomowy: temp + os.replace (brak ryzyka połowicznego pliku)."""
     MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    MEMORY_FILE.write_text(
-        json.dumps(memory, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    try:
+        if MEMORY_FILE.exists():
+            MEMORY_BAK.write_text(
+                MEMORY_FILE.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+    except Exception:
+        pass
+    payload = json.dumps(memory, ensure_ascii=False, indent=2)
+    tmp = MEMORY_FILE.with_name(MEMORY_FILE.name + ".tmp")
+    tmp.write_text(payload, encoding="utf-8")
+    os.replace(tmp, MEMORY_FILE)
+
+
+def export_memory_json() -> str:
+    """Cała pamięć jako tekst JSON — do pobrania/backupu z UI."""
+    return json.dumps(_load_memory(), ensure_ascii=False, indent=2)
+
+
+def import_memory(raw, merge: bool = True) -> dict:
+    """Wczytuje pamięć z JSON (str/bytes/dict). Domyślnie ŁĄCZY z obecną
+    (nic nie kasuje) — bezpieczne przywracanie backupu."""
+    incoming = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else dict(raw)
+    if not isinstance(incoming, dict):
+        raise ValueError("Niepoprawny format pamięci (oczekiwano obiektu JSON).")
+    if not merge:
+        _save_memory(incoming)
+        return incoming
+
+    cur = _load_memory()
+    prefs = {**cur.get("preferences", {}), **incoming.get("preferences", {})}
+    facts = list(cur.get("facts", []))
+    for f in incoming.get("facts", []):
+        if f not in facts:
+            facts.append(f)
+
+    def _merge_exc(a, b):
+        out = [e for e in a if isinstance(e, dict)]
+        seen = {e.get("value", "").lower() for e in out}
+        for e in b:
+            if isinstance(e, dict) and e.get("value", "").lower() not in seen:
+                out.append(e)
+                seen.add(e.get("value", "").lower())
+        return out
+
+    cur_exc = cur.get("exclusions", {}) or {}
+    inc_exc = incoming.get("exclusions", {}) or {}
+    exclusions = {
+        "products": _merge_exc(cur_exc.get("products", []), inc_exc.get("products", [])),
+        "suppliers": _merge_exc(cur_exc.get("suppliers", []), inc_exc.get("suppliers", [])),
+    }
+    history = (list(cur.get("history", [])) + list(incoming.get("history", [])))[-MAX_HISTORY:]
+    merged = {
+        "preferences": prefs,
+        "facts": facts,
+        "exclusions": exclusions,
+        "history": history,
+    }
+    _save_memory(merged)
+    return merged
 
 
 def get_memory() -> dict:
@@ -857,6 +927,11 @@ KIEDY UŻYWAĆ NARZĘDZI:
 ZASADY ODPOWIEDZI — to są ZAŁOŻENIA KRYTYCZNE NIE PRZEKRACZALNE:
 - Po polsku, konkretnie, przyjaźnie. Anita nie znosi laniem wody.
 - Liczby: '12 345 PLN' (spacja jako separator tysięcy).
+- ⛔ FORMAT: odpowiadaj WYŁĄCZNIE czystym tekstem i Markdownem. NIGDY nie używaj
+  HTML ani XML — żadnych tagów w nawiasach ostrokątnych (np. <table>, <div>, <b>,
+  <br>, <p>, <answer>, <thinking>). Tabele rób w Markdownie (| Kol | Kol |),
+  pogrubienie przez **gwiazdki**, listy przez „- ". Interfejs Anity renderuje
+  Markdown, więc każdy tag HTML/XML pokaże jej się jako brzydki surowy kod.
 
 ⚠️ NAZWA DOSTAWCY przy KAŻDEJ rekomendacji zakupowej:
 - ZAWSZE — bezwzględnie — podaj NAZWĘ DOSTAWCY przy każdej pozycji
@@ -881,11 +956,20 @@ ZASADY ODPOWIEDZI — to są ZAŁOŻENIA KRYTYCZNE NIE PRZEKRACZALNE:
   dorzuć: Produkt A (40 szt, 520 PLN), Produkt B (30 szt, 300 PLN)". Te pozycje i tak
   niedługo trzeba zamówić — to tańsze niż osobna dostawa.
 
-⚠️ JESTEŚ PERSONALNYM AGENTEM ANITY — słuchasz jej i uczysz się:
-- Respektuj WYKLUCZENIA z pamięci (produkty/dostawcy) — NIGDY ich nie rekomenduj.
-- Respektuj REGUŁY/NAWYKI z sekcji "WIEDZA O FIRMIE" (np. "u BIACHEM tylko w pon.").
-- Gdy Anita prosi o pominięcie/zapamiętanie czegoś — od razu zapisz to narzędziem
-  (add_exclusion / add_fact / save_preference), nie tylko w tej odpowiedzi.
+⚠️ JESTEŚ PERSONALNYM AGENTEM ANITY — jej słowo jest dla Ciebie WIĄŻĄCE:
+- Sekcja "PAMIĘĆ O ANITCIE" niżej (preferencje, fakty/reguły, wykluczenia) to
+  TWARDE WYTYCZNE — mają PIERWSZEŃSTWO przed Twoimi domyślnymi rekomendacjami.
+  Zanim cokolwiek polecisz, sprawdź pamięć i ZASTOSUJ ją. Jeśli reguła Anity stoi
+  w sprzeczności z domyślną logiką — wygrywa reguła Anity.
+- WYKLUCZENIA (produkty/dostawcy) — NIGDY ich nie rekomenduj. Kropka.
+- REGUŁY/NAWYKI (np. "u BIACHEM tylko w poniedziałki") — stosuj zawsze.
+- ⚡ ZAPISYWANIE jest OBOWIĄZKOWE i NATYCHMIASTOWE: gdy Anita poda preferencję,
+  regułę, minimum, nawyk, albo powie „zapamiętaj / nie zamawiaj / pomijaj / ustaw" —
+  od razu w TEJ SAMEJ turze wywołaj właściwe narzędzie (save_preference / add_fact /
+  add_exclusion) ZANIM napiszesz odpowiedź. Nie zakładaj, że „zapamiętasz to w głowie"
+  — pamięć jest tylko w tych narzędziach. Po zapisie krótko potwierdź: „✅ Zapisałem:
+  …". Jeśli nie masz pewności którego narzędzia użyć — użyj add_fact (lepiej zapisać
+  niż zgubić).
 
 ⚠️ ZAWSZE PODAJ "DLACZEGO" przy każdej rekomendacji:
 - Każda pozycja "do zamówienia" MUSI mieć krótkie uzasadnienie. Narzędzie
@@ -903,12 +987,33 @@ POZOSTAŁE ZASADY:
 - Jeśli używasz narzędzia, krótko wspomnij co znalazłeś (np. "Sprawdziłem
   query_products z filtrem...") — to buduje zaufanie do liczb.
 
-PAMIĘĆ O ANITCIE (z poprzednich sesji):
+════════ PAMIĘĆ O ANITCIE — TWARDE WYTYCZNE (stosuj je, mają pierwszeństwo) ════════
 {memory_text}
+(Powyższe to wiążące ustalenia Anity z poprzednich sesji. Zastosuj je w odpowiedzi.)
 
 === STATYCZNY SNAPSHOT ANALIZY (dla orientacji — szczegóły bierz z narzędzi) ===
 {context}
 === KONIEC SNAPSHOTU ==="""
+
+
+# Tagi HTML, które czyścimy z odpowiedzi (siatka bezpieczeństwa — gdyby model
+# mimo instrukcji wstawił HTML/XML; nie tknie zwykłego "a < b" w tekście).
+_HTML_TAG_RE = re.compile(
+    r"</?(?:table|thead|tbody|tfoot|tr|td|th|div|p|br|hr|b|strong|i|em|u|s|"
+    r"ul|ol|li|span|h[1-6]|pre|code|a|font|center|small|blockquote|figure)\b[^>]*>",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_answer(text: str | None) -> str | None:
+    """Usuwa ewentualne tagi HTML/XML i odkodowuje encje, żeby Anita nigdy nie
+    zobaczyła surowego <table>/<br> itp. Zwykły tekst i Markdown zostają nietknięte."""
+    if not text:
+        return text
+    cleaned = _HTML_TAG_RE.sub("", text)
+    if cleaned != text:
+        cleaned = _html.unescape(cleaned)
+    return cleaned
 
 
 def _build_system_prompt(context: str, extra_system_instructions: str | None) -> str:
@@ -1113,5 +1218,6 @@ def ask_agent(
             None,
         )
 
+    answer = _sanitize_answer(answer)
     add_history(question, answer)
     return answer, tool_log, None
