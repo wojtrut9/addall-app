@@ -367,6 +367,27 @@ def analyze(
     cap = np.maximum((analiza["srednie_dzienne"] * 45).round(0), stan_min)
     analiza["ile_zamowic"] = np.minimum(analiza["ile_zamowic"], cap).astype(int)
 
+    # ── 6a. Ratunek dla pozycji z POPYTEM, które wypadły z rekomendacji ───────
+    # Produkty o niskiej rotacji (sporadyczna sprzedaż) mają prognozę ~0, więc
+    # przy stanie 0 (ktoś kupił i wyzerował) i BEZ ustawionego minimum dawały
+    # ile_zamowic=0 i ginęły w rekomendacjach. Tu wymuszamy sensowne uzupełnienie:
+    # jeśli coś się sprzedało, a efektywny stan jest poniżej celu — zamów do celu.
+    _sold = analiza["ilosc_sprzedana"]
+    _tx = analiza["liczba_transakcji"].where(analiza["liczba_transakcji"] > 0, 1)
+    _typowa = (_sold / _tx).round(0)  # typowa wielkość pojedynczej sprzedaży
+    _smin = (
+        analiza["Stan Min."].fillna(0)
+        if "Stan Min." in analiza.columns
+        else pd.Series(0.0, index=analiza.index)
+    )
+    # cel uzupełnienia: minimum magazynowe jeśli ustawione, inaczej ~1 typowa sprzedaż (min 1 szt.)
+    _cel = np.maximum(_smin, np.maximum(_typowa, 1.0))
+    _brak = np.maximum(0.0, _cel - analiza["efektywny_stan"]).round(0)
+    _do_ratunku = (analiza["ile_zamowic"] <= 0) & (_sold > 0) & (_brak > 0)
+    analiza["ile_zamowic"] = np.where(
+        _do_ratunku, _brak, analiza["ile_zamowic"]
+    ).astype(int)
+
     analiza["wartosc_zamowienia"] = (
         analiza["ile_zamowic"] * analiza["Cena zakupu netto"]
     ).round(2)
@@ -378,21 +399,38 @@ def analyze(
         t = row.get("liczba_transakcji", 0)
         s = row["Stan"]
         wd = row.get("w_drodze", 0)
+        sold = row.get("ilosc_sprzedana", 0) or 0
+        smin = row.get("Stan Min.", 0) or 0
+        efekt = s + wd  # efektywny stan = magazyn + w drodze
 
-        if z == 0 and s > 0 and wd == 0:
-            return "DEAD STOCK"
-        if z == 0 and s == 0 and wd == 0:
+        # Brak jakiejkolwiek aktywności (nic się nie sprzedało w okresie)
+        if sold <= 0 and z == 0:
+            if s > 0 and wd == 0:
+                return "DEAD STOCK"
+            if wd > 0:
+                return "OK"  # brak sprzedaży, ale coś jedzie — zostaw
             return "NIEAKTYWNY"
-        if z == 0 and wd > 0:
-            return "OK"  # nie ma sprzedaży, ale jedzie — zostaw
-        if t < 3:
-            return "JEDNORAZÓWKA"
-        # Status liczymy na bazie EFEKTYWNEGO stanu (włącznie z "w drodze"),
-        # więc jeśli coś jedzie, nie pojawi się jako "ZAMÓW DZIŚ".
+
+        # Poniżej ustawionego minimum magazynowego (ręczny „reminder" Anity)
+        if smin > 0 and efekt < smin:
+            return "ZAMÓW DZIŚ" if efekt <= 0 else "ZAMÓW TYDZIEŃ"
+
+        # WYPRZEDANE z popytem — sprzedało się, a efektywny stan spadł do 0.
+        # Łapiemy to NIEZALEŻNIE od rotacji i nawet gdy minimum = 0 (kluczowa
+        # poprawka: produkty niskorotacyjne przy stanie 0 już nie giną).
+        if sold > 0 and efekt <= 0:
+            return "ZAMÓW DZIŚ"
+
+        # Klasyczne tempo rotacji (na EFEKTYWNYM stanie — jeśli coś jedzie,
+        # nie pojawi się jako "ZAMÓW DZIŚ").
         if z >= 0.5 and d < 8:
             return "ZAMÓW DZIŚ"
         if z >= 0.3 and d < 15:
             return "ZAMÓW TYDZIEŃ"
+
+        # Mało transakcji, ale coś jeszcze na stanie / rotacja niska
+        if t < 3:
+            return "JEDNORAZÓWKA"
         return "OK"
 
     analiza["status"] = analiza.apply(get_status, axis=1)
@@ -408,20 +446,29 @@ def analyze(
         st = row.get("status", "")
         smin = row.get("Stan Min.", 0) or 0
         stan = row.get("Stan", 0) or 0
+        sold = row.get("ilosc_sprzedana", 0) or 0
+        tx = row.get("liczba_transakcji", 0) or 0
+        efekt = stan + (wd or 0)
         parts = []
         if st == "DEAD STOCK":
             return "Brak sprzedaży w okresie — zamrożony kapitał, nie zamawiać."
         if st == "NIEAKTYWNY":
             return "Brak stanu i brak sprzedaży."
+        # WYPRZEDANE — najważniejszy powód, na początek
+        if sold > 0 and efekt <= 0:
+            parts.append(
+                f"WYPRZEDANE — sprzedało się {sold:.0f} szt w okresie, stan spadł do 0 "
+                "(uzupełnij, żeby nie zabrakło)"
+            )
+        elif smin > 0 and stan < smin:
+            parts.append(f"stan {stan:.0f} poniżej minimum {smin:.0f}")
         if z > 0:
             parts.append(f"schodzi {z:.2f} szt/dzień")
-            if d < 9999:
+            if 0 < d < 9999:
                 parts.append(f"zapasu na ~{d:.0f} dni")
         if wd > 0:
             parts.append(f"w drodze już {wd:.0f} szt")
-        if smin > 0 and stan < smin:
-            parts.append(f"stan {stan:.0f} poniżej minimum {smin:.0f}")
-        if st == "JEDNORAZÓWKA":
+        if 0 < tx < 3 and not (sold > 0 and efekt <= 0):
             parts.append("mało transakcji — sprawdź czy to nie jednorazówka")
         return "; ".join(parts) if parts else "Zapas wystarczający."
 

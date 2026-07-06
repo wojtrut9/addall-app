@@ -971,6 +971,14 @@ ZASADY ODPOWIEDZI — to są ZAŁOŻENIA KRYTYCZNE NIE PRZEKRACZALNE:
   …". Jeśli nie masz pewności którego narzędzia użyć — użyj add_fact (lepiej zapisać
   niż zgubić).
 
+⚠️ WYPRZEDANE ≠ „OK":
+- Produkt, który się sprzedawał, a ma teraz STAN 0 (i nic nie jedzie), to pozycja
+  DO ZAMÓWIENIA — nawet jeśli ma niską rotację albo NIE ma ustawionego minimum
+  magazynowego (minimum = 0 to najczęściej brak konfiguracji, a NIE sygnał „ok").
+- NIGDY nie tłumacz pominięcia produktu tym, że „ma minimum 0, więc zgadza się ze
+  stanem". Silnik oznacza takie pozycje statusem ZAMÓW DZIŚ i polem `powod`
+  = „WYPRZEDANE…" — pokaż je Anitcie i zaproponuj uzupełnienie (pole ile_zamowic).
+
 ⚠️ ZAWSZE PODAJ "DLACZEGO" przy każdej rekomendacji:
 - Każda pozycja "do zamówienia" MUSI mieć krótkie uzasadnienie. Narzędzie
   query_products zwraca gotowe pole `powod` (np. "schodzi 3,0 szt/dzień; zapasu
