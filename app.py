@@ -632,6 +632,25 @@ if _unmatched:
         f"(sprawdź pisownię/alias): {', '.join(_unmatched)}"
     )
 
+# ── Diagnostyka produktów indywidualnych (grupa INDYWIDUALNE) ─────────────────
+_indyw = (summary.get("pozycje_indywidualne") or []) if isinstance(summary, dict) else []
+if _indyw:
+    _grupy = ", ".join(summary.get("grupy_wykluczone") or ["INDYWIDUALNE"])
+    with st.expander(
+        f"🙈 Pominięto {len(_indyw)} produktów z grupy indywidualnej ({_grupy}) — "
+        "bot ich nie rekomenduje"
+    ):
+        st.caption(
+            "Produkty z grupy INDYWIDUALNE (klienckie/niestandardowe) są celowo "
+            "wyłączone z rekomendacji zamówień. Grupa aktualizuje się na bieżąco "
+            "z iBiznes."
+        )
+        st.dataframe(
+            pd.DataFrame(_indyw),
+            use_container_width=True,
+            hide_index=True,
+        )
+
 # ═══════════════════════════════════════════════════════════════════
 # GŁÓWNE ZAKŁADKI
 # ═══════════════════════════════════════════════════════════════════

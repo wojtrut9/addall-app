@@ -3,6 +3,7 @@ engine.py — Add All Inventory Analysis Engine
 Logika analizy: czyta pliki, liczy metryki, generuje rekomendacje.
 """
 import io
+import os
 import re
 import warnings
 from datetime import datetime
@@ -78,6 +79,53 @@ def match_minimum(min_log: dict, dostawca) -> float:
         if nk and (nk in target or target in nk):
             best = max(best, float(v))
     return best
+
+
+# ── Grupy wykluczone z rekomendacji (produkty indywidualne) ──────────────────
+# Anita utworzyła w iBiznes grupę "INDYWIDUALNE" — produkty przypisane pod
+# konkretnego klienta / niestandardowe. Bot NIE ma ich brać pod uwagę w
+# rekomendacjach zamówień. Tabela w iBiznes zmienia się na bieżąco, więc
+# filtrujemy dynamicznie po kolumnie "Grupa" przy każdej analizie.
+# Nazwy grup można nadpisać zmienną środowiskową ANITA_EXCLUDED_GROUPS
+# (rozdzielone przecinkami).
+DEFAULT_EXCLUDED_GROUPS = ("INDYWIDUALNE",)
+
+
+def _excluded_groups() -> tuple:
+    raw = os.environ.get("ANITA_EXCLUDED_GROUPS", "")
+    if raw.strip():
+        return tuple(g.strip() for g in raw.split(",") if g.strip())
+    return DEFAULT_EXCLUDED_GROUPS
+
+
+def _norm_group(name) -> str:
+    """Normalizacja nazwy grupy: upper, bez interpunkcji, pojedyncze spacje."""
+    s = str(name or "").upper()
+    s = re.sub(r"[^\w]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def find_grupa_col(df):
+    """Znajdź kolumnę z grupą towarową (Grupa / Kategoria / Gr...)."""
+    for hint in ("grupa", "kategoria", "gr."):
+        for c in df.columns:
+            if hint == str(c).strip().lower() or hint in str(c).strip().lower():
+                return c
+    return None
+
+
+def is_excluded_group(value, excluded=None) -> bool:
+    """Czy dana wartość grupy jest na liście grup wykluczonych."""
+    if excluded is None:
+        excluded = _excluded_groups()
+    nv = _norm_group(value)
+    if not nv:
+        return False
+    for g in excluded:
+        ng = _norm_group(g)
+        if ng and (ng == nv or ng in nv):
+            return True
+    return False
 
 
 def parse_polish_date(s):
@@ -324,6 +372,26 @@ def analyze(
         analiza["wartosc_w_drodze"] = 0.0
     else:
         analiza["wartosc_w_drodze"] = analiza["wartosc_w_drodze"].fillna(0)
+
+    # ── 5b. Wytnij produkty z grup wykluczonych (np. "INDYWIDUALNE") ─────────
+    # Anita trzyma w iBiznes grupę produktów indywidualnych/klienckich, których
+    # bot nie ma brać pod uwagę. Grupa zmienia się na bieżąco → filtrujemy tu.
+    _excl_groups = _excluded_groups()
+    _grupa_col = find_grupa_col(analiza)
+    _wykluczone_grupa = []
+    if _grupa_col is not None:
+        _mask_excl = analiza[_grupa_col].apply(
+            lambda v: is_excluded_group(v, _excl_groups)
+        )
+        if _mask_excl.any():
+            _naz_col = find_col(analiza, "nazwa towaru / usługi", "nazwa towaru", "nazwa")
+            for _, _r in analiza[_mask_excl].iterrows():
+                _wykluczone_grupa.append({
+                    "kod": str(_r.get(kod_col, "")),
+                    "nazwa": str(_r.get(_naz_col, "")) if _naz_col else "",
+                    "grupa": str(_r.get(_grupa_col, "")),
+                })
+            analiza = analiza[~_mask_excl].reset_index(drop=True)
 
     # ── 6. Kluczowe metryki ──────────────────────────────────────────────────
     # Efektywny stan = to co w magazynie + to co już zamówione u dostawcy
@@ -577,6 +645,11 @@ def analyze(
         "supplier_open_orders": supplier_open_orders,
         # Liczba dostawców u których są otwarte dokumenty
         "dostawcow_z_otwartymi": len(supplier_open_orders),
+        # Produkty pominięte, bo należą do grupy wykluczonej (np. INDYWIDUALNE).
+        # Bot świadomie ich nie rekomenduje — Anita trzyma je pod klienta.
+        "grupy_wykluczone": list(_excl_groups),
+        "pozycje_indywidualne": _wykluczone_grupa,
+        "pozycje_indywidualne_liczba": len(_wykluczone_grupa),
     }
 
     context = _build_llm_context(analiza, zam_df, summary)

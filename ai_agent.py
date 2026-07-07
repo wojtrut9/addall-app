@@ -449,7 +449,7 @@ def list_dostawcy(
 def get_overall_metrics(summary: dict) -> str:
     """Zwraca pełny słownik metryk (z minimami logistycznymi, bez ciężkiej
     mapy supplier_open_orders)."""
-    skip = {"supplier_open_orders"}
+    skip = {"supplier_open_orders", "pozycje_indywidualne"}
     return json.dumps(
         {k: v for k, v in summary.items() if k not in skip},
         ensure_ascii=False,
@@ -978,6 +978,15 @@ ZASADY ODPOWIEDZI — to są ZAŁOŻENIA KRYTYCZNE NIE PRZEKRACZALNE:
 - NIGDY nie tłumacz pominięcia produktu tym, że „ma minimum 0, więc zgadza się ze
   stanem". Silnik oznacza takie pozycje statusem ZAMÓW DZIŚ i polem `powod`
   = „WYPRZEDANE…" — pokaż je Anitcie i zaproponuj uzupełnienie (pole ile_zamowic).
+
+⚠️ PRODUKTY INDYWIDUALNE (grupa "INDYWIDUALNE") — POMIJAJ:
+- Anita trzyma w iBiznes grupę produktów indywidualnych/klienckich (grupa
+  "INDYWIDUALNE"). Tych pozycji silnik JUŻ nie wpuszcza do analizy — więc nie
+  pojawią się w query_products ani w rekomendacjach. To jest zamierzone.
+- NIE proponuj ich do zamówienia i NIE dobijaj nimi minimów logistycznych.
+- Liczbę pominiętych pozycji znajdziesz w metrykach (`pozycje_indywidualne_liczba`,
+  `grupy_wykluczone`). Jeśli Anita pyta „czemu nie widzę produktu X" — może być w
+  tej grupie; wyjaśnij, że produkty z grupy INDYWIDUALNE są celowo pomijane.
 
 ⚠️ ZAWSZE PODAJ "DLACZEGO" przy każdej rekomendacji:
 - Każda pozycja "do zamówienia" MUSI mieć krótkie uzasadnienie. Narzędzie
