@@ -377,6 +377,14 @@ _STAN_MIN_HINTS = ["StanMin", "MinStan", "Minimum", "MinIlosc"]
 _DOSTAWCA_HINTS = ["Dostawca", "Supplier", "Kontrahent"]
 _GRUPA_HINTS  = ["Grupa", "Kategoria", "Klasa", "Typ"]
 _JM_HINTS     = ["Jm", "JM", "JedMiary", "Jednostka"]
+# Nr katalogowy produktu (indeks u dostawcy / katalogowy). Celowo NIE używamy
+# generycznych "Kod/Symbol/Indeks" — to jest nasz kod produktu. Można nadpisać
+# ręcznie zmienną ANITA_KATALOG_COL (nazwa kolumny w kartotece), a gdy nr
+# katalogowy jest w OSOBNEJ tabeli — przez ANITA_KATALOG_TABLE/_KEY/_VAL (JOIN).
+_KATALOG_HINTS = [
+    "Katalog", "Katalogowy", "NrKat", "NrKatalogowy", "KodKat", "KatNr",
+    "IndeksKat", "NumerKatalogowy", "KodKatalogowy",
+]
 # Flaga aktywności kartoteki — w iBiznes typowo 'Akt' z wartościami T/N
 _AKT_HINTS    = ["Akt", "Aktywny", "Active", "Aktywna"]
 
@@ -626,6 +634,28 @@ def fetch_kartoteka(
         else:           select_parts.append("'' AS `Dostawca`")
         if jm_col:     select_parts.append(f"`{jm_col}` AS `JM`")
 
+        # Nr katalogowy — 1:1 z produktem (jak ID). Trzy warianty źródła:
+        #  a) kolumna na karcie towaru (auto-wykrycie lub ANITA_KATALOG_COL),
+        #  b) osobna tabela (ANITA_KATALOG_TABLE/_KEY/_VAL) → LEFT JOIN po kodzie,
+        #  c) brak → pusta kolumna (diagnostyka pokaże dostępne kolumny).
+        katalog_col = _map_col(
+            cols, os.environ.get("ANITA_KATALOG_COL"), *_KATALOG_HINTS
+        )
+        kt_table = (os.environ.get("ANITA_KATALOG_TABLE") or "").strip()
+        kt_key   = (os.environ.get("ANITA_KATALOG_KEY") or "").strip()
+        kt_val   = (os.environ.get("ANITA_KATALOG_VAL") or "").strip()
+        join_clause = ""
+        if katalog_col:
+            select_parts.append(f"`{katalog_col}` AS `Nr katalogowy`")
+        elif kt_table and kt_key and kt_val:
+            select_parts.append(f"`kat`.`{kt_val}` AS `Nr katalogowy`")
+            join_clause = (
+                f" LEFT JOIN `{kt_table}` `kat` "
+                f"ON `kat`.`{kt_key}` = `{tbl}`.`{kod_col}`"
+            )
+        else:
+            select_parts.append("'' AS `Nr katalogowy`")
+
         # Filtr aktywności — tylko produkty z Akt='T'/'1'/NULL (NULL traktujemy jako
         # aktywne) i NIE anulowane (Anul != 'T'/'Y').
         conds = []
@@ -641,7 +671,7 @@ def fetch_kartoteka(
             )
         where_clause = (" WHERE " + " AND ".join(conds)) if conds else ""
 
-        sql = f"SELECT {', '.join(select_parts)} FROM `{tbl}`{where_clause}"
+        sql = f"SELECT {', '.join(select_parts)} FROM `{tbl}`{join_clause}{where_clause}"
 
         try:
             df = _q(conn, sql)
@@ -689,7 +719,27 @@ def _remap_kartoteka(df: pd.DataFrame) -> pd.DataFrame:
     if (c := _pick_col(cols, *_STAN_MIN_HINTS)): rename[c] = "Stan Min."
     if (c := _pick_col(cols, *_DOSTAWCA_HINTS)): rename[c] = "Dostawca"
     if (c := _pick_col(cols, *_GRUPA_HINTS)):  rename[c] = "Grupa"
+    _kat_env = os.environ.get("ANITA_KATALOG_COL")
+    if (c := (_col_present(cols, _kat_env) or _pick_col(cols, *_KATALOG_HINTS))):
+        rename[c] = "Nr katalogowy"
     return df.rename(columns=rename)
+
+
+def get_kartoteka_columns(conn: pymysql.Connection, tbl_info: dict) -> dict:
+    """Diagnostyka: zwraca surowe nazwy kolumn tabel kartoteki + która kolumna
+    została rozpoznana jako nr katalogowy. Pomaga ustawić ANITA_KATALOG_COL,
+    gdy auto-wykrycie nie trafi."""
+    out = {}
+    for tbl_key in ("towary_spzoo", "towary_firma"):
+        tbl = tbl_info.get(tbl_key)
+        if not tbl:
+            continue
+        cols = get_columns(conn, tbl)
+        detected = _map_col(
+            cols, os.environ.get("ANITA_KATALOG_COL"), *_KATALOG_HINTS
+        )
+        out[tbl] = {"kolumny": cols, "nr_katalogowy_wykryty": detected}
+    return out
 
 
 # ── Fetch: Zamówienia do dostawców ────────────────────────────────────────────

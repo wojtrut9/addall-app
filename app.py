@@ -300,11 +300,13 @@ with st.expander(_data_title, expanded=not _loaded):
                     try:
                         from ibiznes_connector import (
                             get_connection, discover_tables, identify_tables,
+                            get_kartoteka_columns,
                         )
                         conn = get_connection(db_url_input)
                         try:
                             tables = discover_tables(conn)
                             tbl_info = identify_tables(conn)
+                            kart_cols_info = get_kartoteka_columns(conn, tbl_info)
                         finally:
                             conn.close()
                         addall = [t for t in tables if t.lower().startswith("addall")]
@@ -327,6 +329,25 @@ with st.expander(_data_title, expanded=not _loaded):
                             st.code("firma*:\n  " + "\n  ".join(firma), language="text")
                         if other:
                             st.code("inne:\n  " + "\n  ".join(other), language="text")
+
+                        # Diagnostyka nr katalogowego — pokaż co wykryto i jakie
+                        # kolumny są w kartotece (do ustawienia ANITA_KATALOG_COL).
+                        with st.expander("🔖 Nr katalogowy — diagnostyka kolumn kartoteki"):
+                            for _tbl, _info in (kart_cols_info or {}).items():
+                                _det = _info.get("nr_katalogowy_wykryty")
+                                if _det:
+                                    st.success(f"`{_tbl}` → wykryto kolumnę **{_det}** jako nr katalogowy")
+                                else:
+                                    st.warning(
+                                        f"`{_tbl}` → nie rozpoznano nr katalogowego automatycznie. "
+                                        "Wskaż kolumnę zmienną `ANITA_KATALOG_COL`, a jeśli nr jest "
+                                        "w osobnej tabeli — `ANITA_KATALOG_TABLE` + `ANITA_KATALOG_KEY` "
+                                        "(kod produktu) + `ANITA_KATALOG_VAL` (nr katalogowy)."
+                                    )
+                                st.code(
+                                    "kolumny:\n  " + "\n  ".join(_info.get("kolumny", [])),
+                                    language="text",
+                                )
                     except Exception as e:
                         st.error(f"Błąd: {e}")
 
@@ -553,10 +574,15 @@ nazwa_col = find_col(analiza, "nazwa towaru")
 kod_col   = find_col(analiza, "kod towaru / usługi", "kod towaru")
 dos_col   = find_col(analiza, "dostawca")
 
+# Kolejność kolumn list "Zamów dziś / w tygodniu" (wg ustaleń z Anitą):
+# nasz kod → nazwa → nr katalogowy dostawcy (zamiast rubryki Dostawca —
+# dostawcę mamy już w nagłówku grupy) → Stan i Zamów obok siebie → w drodze →
+# starczy dni → (niewymienione zostają) → Stan Min. na samym końcu.
 display_cols = [c for c in [
-    kod_col, nazwa_col, dos_col,
-    "Stan", "w_drodze", "Stan Min.", "srednie_dzienne",
-    "dni_do_wyczerpania", "ile_zamowic", "wartosc_zamowienia", "powod",
+    kod_col, nazwa_col, "Nr katalogowy",
+    "Stan", "ile_zamowic", "w_drodze", "dni_do_wyczerpania",
+    "srednie_dzienne", "wartosc_zamowienia", "powod",
+    "Stan Min.",
 ] if c and c in analiza.columns]
 
 col_labels = {
