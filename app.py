@@ -24,6 +24,7 @@ from ai_agent import (
     remove_exclusion,
     export_memory_json,
     import_memory,
+    memory_storage_status,
 )
 
 # ── Konfiguracja strony ───────────────────────────────────────────────────────
@@ -1003,7 +1004,21 @@ with tab_agent:
             with col_b1:
                 submitted = st.form_submit_button("▶ Zapytaj", type="primary", use_container_width=True)
             with col_b2:
-                st.caption(f"Model: **{actual_model}** | Pamięć: **{mem_count}** zapisów")
+                _mem_store = memory_storage_status()
+                st.caption(
+                    f"Model: **{actual_model}** | Pamięć: **{mem_count}** zapisów "
+                    f"| Kopie: **{_mem_store['snapshots']}** "
+                    f"| Dysk: {'✅ trwały' if _mem_store['persistent'] else '🔴 ULOTNY'}"
+                )
+
+        if not memory_storage_status()["persistent"]:
+            st.error(
+                "🔴 **PAMIĘĆ AGENTA JEST ULOTNA — ZNIKNIE PRZY NAJBLIŻSZYM RESTARCIE!**\n\n"
+                f"Powód: {memory_storage_status()['reason']}\n\n"
+                "Napraw teraz: Railway → serwis `addall-app` → Settings → Volumes → "
+                "dodaj wolumen na `/app/data`. Zanim to zrobisz — pobierz kopię pamięci "
+                "przyciskiem eksportu, bo redeploy ją skasuje."
+            )
 
         if submitted and not api_key:
             st.warning(
@@ -1257,7 +1272,7 @@ with tab_exp:
 st.divider()
 st.caption(
     f"Add All Asystent Zakupowy v2.3 (Claude Sonnet 4.6 + minima logistyczne + uczenie) | "
-    f"Dane analizy nie są zapisywane, pamięć agenta = `data/anita_memory.json` "
-    f"(dla persystencji między deployami dodaj Railway Volume na `/app/data`) | "
+    f"Dane analizy nie są zapisywane, pamięć agenta = `{memory_storage_status()['path']}` "
+    f"({memory_storage_status()['reason']}, kopie rotowane: {memory_storage_status()['snapshots']}) | "
     f"{datetime.now().strftime('%Y')}"
 )

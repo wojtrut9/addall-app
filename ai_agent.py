@@ -30,17 +30,74 @@ from engine import lookup_supplier_open_orders, match_minimum
 
 # ── Pamięć Anity ──────────────────────────────────────────────────────────────
 
-MEMORY_FILE = Path(os.environ.get("ANITA_MEMORY_PATH", "data/anita_memory.json"))
+def _resolve_memory_file() -> Path:
+    """Gdzie trzymać pamięć — zawsze na trwałym dysku, jeśli tylko istnieje.
+
+    Kolejność: jawna zmienna ANITA_MEMORY_PATH → wolumen Railway → dysk lokalny.
+    Railway wystawia RAILWAY_VOLUME_MOUNT_PATH tylko wtedy, gdy wolumen jest
+    faktycznie podpięty, więc to jest wiarygodny sygnał trwałości.
+    """
+    explicit = os.environ.get("ANITA_MEMORY_PATH")
+    if explicit:
+        return Path(explicit)
+    volume = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
+    if volume:
+        return Path(volume) / "anita_memory.json"
+    return Path("data/anita_memory.json")
+
+
+MEMORY_FILE = _resolve_memory_file()
 MEMORY_BAK = Path(str(MEMORY_FILE) + ".bak")  # kopia ostatniej dobrej wersji
+SNAPSHOT_DIR = MEMORY_FILE.parent / "backups"  # rotowane kopie historyczne
+MAX_SNAPSHOTS = 30
 MAX_HISTORY = 50
+
+
+def memory_storage_status() -> dict:
+    """Czy pamięć leży na trwałym dysku? Do wyświetlenia ostrzeżenia w UI.
+
+    Bez tego utrata pamięci jest cicha — apka wygląda normalnie, a zapisy
+    znikają przy każdym restarcie kontenera.
+    """
+    volume = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
+    on_railway = bool(os.environ.get("RAILWAY_SERVICE_ID") or os.environ.get("RAILWAY_ENVIRONMENT"))
+    path = MEMORY_FILE.absolute()
+
+    if not on_railway:
+        persistent, reason = True, "dysk lokalny"
+    elif volume and str(path).startswith(str(Path(volume).absolute())):
+        persistent, reason = True, f"wolumen Railway ({volume})"
+    else:
+        persistent, reason = False, "BRAK WOLUMENU — dysk kontenera znika przy restarcie"
+
+    try:
+        snapshots = len(list(SNAPSHOT_DIR.glob("anita_memory_*.json")))
+    except Exception:
+        snapshots = 0
+
+    return {
+        "persistent": persistent,
+        "reason": reason,
+        "path": str(path),
+        "snapshots": snapshots,
+    }
 
 
 def _default_memory() -> dict:
     return {"preferences": {}, "facts": [], "history": [], "exclusions": {"products": [], "suppliers": []}}
 
 
+def _snapshot_files() -> list[Path]:
+    """Rotowane kopie, od najnowszej. Nazwa zawiera datę, więc sort działa."""
+    try:
+        return sorted(SNAPSHOT_DIR.glob("anita_memory_*.json"), reverse=True)
+    except Exception:
+        return []
+
+
 def _load_memory() -> dict:
-    """Czyta pamięć; przy uszkodzeniu głównego pliku próbuje kopii .bak."""
+    """Czyta pamięć; przy uszkodzeniu głównego pliku próbuje kopii .bak,
+    a gdy plik w ogóle zniknął (świeży kontener) — najnowszej rotowanej kopii."""
     for p in (MEMORY_FILE, MEMORY_BAK):
         try:
             if p.exists():
@@ -49,6 +106,19 @@ def _load_memory() -> dict:
                     return data
         except Exception:
             continue
+
+    # Główny plik NIE ISTNIEJE — ratujemy z rotowanej kopii.
+    # Uwaga: świadomie tylko przy braku pliku. Gdyby plik istniał i był pusty,
+    # oznaczałoby to celowe wyczyszczenie pamięci i nie wolno go cofać.
+    for snap in _snapshot_files():
+        try:
+            data = json.loads(snap.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                _save_memory(data)  # od razu przywróć na główną ścieżkę
+                return data
+        except Exception:
+            continue
+
     return _default_memory()
 
 
@@ -68,6 +138,26 @@ def _save_memory(memory: dict) -> None:
     tmp = MEMORY_FILE.with_name(MEMORY_FILE.name + ".tmp")
     tmp.write_text(payload, encoding="utf-8")
     os.replace(tmp, MEMORY_FILE)
+    _write_snapshot(payload)
+
+
+def _write_snapshot(payload: str) -> None:
+    """Rotowana kopia z datą przy każdym zapisie (trzymamy MAX_SNAPSHOTS ostatnich).
+
+    Chroni przed tym, czego .bak nie łapie: przypadkowym wyczyszczeniem pamięci
+    albo błędnym nadpisaniem sprzed wielu zapisów. Awarie zapisu kopii nigdy
+    nie mogą wywrócić zapisu głównego."""
+    try:
+        SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        snap = SNAPSHOT_DIR / f"anita_memory_{stamp}.json"
+        # Nadpisujemy bez warunku: kilka zapisów w tej samej sekundzie musi
+        # zostawić stan NAJNOWSZY, inaczej migawka jest cofnięta o jeden zapis.
+        snap.write_text(payload, encoding="utf-8")
+        for old in _snapshot_files()[MAX_SNAPSHOTS:]:
+            old.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def export_memory_json() -> str:
@@ -1121,6 +1211,12 @@ def _ask_openai(question, analiza, summary, system_prompt, history_msgs, api_key
             continue
 
         answer = msg.content or ""
+        if not answer.strip():
+            last_error = (
+                f"Model {model} zwrócił pustą odpowiedź "
+                f"(finish_reason={response.choices[0].finish_reason})."
+            )
+            answer = None
         break
 
     return answer, tool_log, last_error
@@ -1143,7 +1239,12 @@ def _ask_anthropic(question, analiza, summary, system_prompt, history_msgs, api_
     for iteration in range(max_iters):
         base_kwargs = dict(
             model=model,
-            max_tokens=4096,
+            # UWAGA: max_tokens to wspólny budżet na myślenie (thinking) I na tekst
+            # odpowiedzi. Przy zbyt małym limicie myślenie zjada całość i wraca
+            # odpowiedź BEZ bloku tekstowego (stop_reason="max_tokens") — czyli
+            # z punktu widzenia Anity "bot nie odpisuje". 16k jest bezpieczne
+            # bez streamingu (wyżej grozi timeout HTTP w SDK).
+            max_tokens=16000,
             system=system_prompt,
             tools=ANTHROPIC_TOOLS,
             messages=messages,
@@ -1190,6 +1291,15 @@ def _ask_anthropic(question, analiza, summary, system_prompt, history_msgs, api_
         answer = "".join(
             b.text for b in response.content if getattr(b, "type", None) == "text"
         )
+        if not answer.strip():
+            # Model nic nie napisał — najczęściej myślenie wyczerpało max_tokens.
+            # Bez tego komunikatu Anita widzi po prostu pustą wiadomość.
+            last_error = (
+                f"Model {model} zwrócił pustą odpowiedź "
+                f"(stop_reason={response.stop_reason}). "
+                "Jeśli stop_reason=max_tokens — zwiększ max_tokens albo zadaj węższe pytanie."
+            )
+            answer = None
         break
 
     return answer, tool_log, last_error
@@ -1236,5 +1346,9 @@ def ask_agent(
         )
 
     answer = _sanitize_answer(answer)
+    if not (answer or "").strip():
+        # Ostatnia siatka bezpieczeństwa: nigdy nie oddawaj pustego tekstu do UI.
+        return None, tool_log, f"Model {model} nie zwrócił żadnej treści do wyświetlenia."
+
     add_history(question, answer)
     return answer, tool_log, None
